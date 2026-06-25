@@ -52,6 +52,7 @@ struct MaxGLBImportSettings
 
     BOOL importTextures;
     BOOL addParentNode;
+    BOOL preserveHierarchy;
     BOOL normalizeSize;
     float normalizeTargetSize;
     float appliedUniformScale;
@@ -60,6 +61,7 @@ struct MaxGLBImportSettings
     MaxGLBImportSettings()
         : importTextures(TRUE)
         , addParentNode(TRUE)
+        , preserveHierarchy(TRUE)
         , normalizeSize(FALSE)
         , normalizeTargetSize(1.0f)
         , appliedUniformScale(1.0f)
@@ -89,12 +91,22 @@ enum MaxGLBAlphaMode
 };
 
 
+enum MaxGLBExportTransformMode
+{
+    MAXGLB_TRANSFORM_BAKE = 0,
+    MAXGLB_TRANSFORM_PRESERVE = 1
+};
+
+
 struct MaxGLBExportSettings
 {
     float scaleFactor;
     BOOL normalizeSize;
     float normalizeTargetSize;
     float appliedUniformScale;
+
+    int transformMode;
+    BOOL preserveHierarchy;
 
     BOOL exportMaterials;
     BOOL exportTextures;
@@ -111,6 +123,8 @@ struct MaxGLBExportSettings
         , normalizeSize(FALSE)
         , normalizeTargetSize(1.0f)
         , appliedUniformScale(1.0f)
+        , transformMode(MAXGLB_TRANSFORM_BAKE)
+        , preserveHierarchy(FALSE)
         , exportMaterials(TRUE)
         , exportTextures(TRUE)
         , alphaMode(MAXGLB_ALPHA_AUTO)
@@ -366,6 +380,825 @@ static const DWORD MAXGLB_ALPHA_METADATA_SUB_ID =
 
 static const DWORD MAXGLB_ALPHA_FLAG_OPACITY_FROM_BASE_ALPHA =
     0x00000001u;
+
+
+static const DWORD MAXGLB_TEXTURE_METADATA_MAGIC =
+    0x54584D50u; // "TXMP"
+
+static const DWORD MAXGLB_TEXTURE_METADATA_VERSION =
+    1u;
+
+static const DWORD MAXGLB_TEXTURE_METADATA_SUB_ID =
+    0x54585246u; // "TXRF"
+
+
+struct MaxGLBTextureMetadata
+{
+    DWORD magic;
+    DWORD version;
+
+    float offset[2];
+    float scale[2];
+    float rotation;
+
+    int texCoord;
+    int wrapS;
+    int wrapT;
+    int minFilter;
+    int magFilter;
+
+    // Snapshot of the Max Bitmap Coordinates values applied on import.
+    // If these still match during export, the exact original glTF values
+    // are reused. If the artist edited them, the current Max values win.
+    float maxUOffset;
+    float maxVOffset;
+    float maxUScale;
+    float maxVScale;
+    float maxWAngle;
+
+    int maxMapChannel;
+    int maxTextureTiling;
+};
+
+
+static BOOL MaxGLBNearlyEqual(
+    float left,
+    float right,
+    float epsilon = 1.0e-5f)
+{
+    return fabsf(left - right) <=
+        epsilon;
+}
+
+
+static int GetDefaultGltfMinFilter()
+{
+    return 9987; // LINEAR_MIPMAP_LINEAR
+}
+
+
+static int GetDefaultGltfMagFilter()
+{
+    return 9729; // LINEAR
+}
+
+
+static int GetDefaultGltfWrapMode()
+{
+    return 10497; // REPEAT
+}
+
+
+// 3ds Max's legacy StdUVGen does not apply offset/scale/rotation with the
+// same pivot and operation order as KHR_texture_transform. To preserve the
+// exact glTF result, transformed UVs are baked into additional mesh map
+// channels. The Bitmap itself then uses identity coordinates and points at
+// the baked channel. Channels 1 and 2 remain the untouched TEXCOORD_0 and
+// TEXCOORD_1 data required for an exact round-trip export.
+struct MaxGLBBakedTextureChannel
+{
+    int sourceTexCoord;
+    float offset[2];
+    float scale[2];
+    float rotation;
+    int maxMapChannel;
+
+    MaxGLBBakedTextureChannel()
+        : sourceTexCoord(0)
+        , rotation(0.0f)
+        , maxMapChannel(0)
+    {
+        offset[0] = 0.0f;
+        offset[1] = 0.0f;
+        scale[0] = 1.0f;
+        scale[1] = 1.0f;
+    }
+};
+
+
+// Import is single-threaded. This lookup is valid while the material(s) for
+// the current imported mesh are being created.
+static std::map<const cgltf_texture_view*, int>
+    g_activeImportTextureViewMapChannels;
+
+
+static int GetEffectiveGltfTexCoord(
+    const cgltf_texture_view* textureView)
+{
+    if (textureView == NULL)
+    {
+        return 0;
+    }
+
+    int texCoord =
+        textureView->texcoord;
+
+    if (textureView->has_transform &&
+        textureView->transform.has_texcoord)
+    {
+        texCoord =
+            textureView->transform.texcoord;
+    }
+
+    return texCoord < 0
+        ? 0
+        : texCoord;
+}
+
+
+static BOOL HasNonDefaultGltfTextureTransform(
+    const cgltf_texture_view* textureView)
+{
+    if (textureView == NULL ||
+        !textureView->has_transform)
+    {
+        return FALSE;
+    }
+
+    return !MaxGLBNearlyEqual(
+                static_cast<float>(
+                    textureView->transform.offset[0]),
+                0.0f) ||
+        !MaxGLBNearlyEqual(
+                static_cast<float>(
+                    textureView->transform.offset[1]),
+                0.0f) ||
+        !MaxGLBNearlyEqual(
+                static_cast<float>(
+                    textureView->transform.scale[0]),
+                1.0f) ||
+        !MaxGLBNearlyEqual(
+                static_cast<float>(
+                    textureView->transform.scale[1]),
+                1.0f) ||
+        !MaxGLBNearlyEqual(
+                static_cast<float>(
+                    textureView->transform.rotation),
+                0.0f);
+}
+
+
+static BOOL BakedTextureChannelsMatch(
+    const MaxGLBBakedTextureChannel& left,
+    const MaxGLBBakedTextureChannel& right)
+{
+    return left.sourceTexCoord ==
+            right.sourceTexCoord &&
+        MaxGLBNearlyEqual(
+            left.offset[0],
+            right.offset[0]) &&
+        MaxGLBNearlyEqual(
+            left.offset[1],
+            right.offset[1]) &&
+        MaxGLBNearlyEqual(
+            left.scale[0],
+            right.scale[0]) &&
+        MaxGLBNearlyEqual(
+            left.scale[1],
+            right.scale[1]) &&
+        MaxGLBNearlyEqual(
+            left.rotation,
+            right.rotation);
+}
+
+
+static void ApplyGltfTextureTransformToUv(
+    const MaxGLBBakedTextureChannel& transform,
+    float sourceU,
+    float sourceV,
+    float* outU,
+    float* outV)
+{
+    const float cosine =
+        cosf(transform.rotation);
+
+    const float sine =
+        sinf(transform.rotation);
+
+    const float scaledU =
+        sourceU * transform.scale[0];
+
+    const float scaledV =
+        sourceV * transform.scale[1];
+
+    if (outU != NULL)
+    {
+        *outU =
+            transform.offset[0] +
+            cosine * scaledU +
+            sine * scaledV;
+    }
+
+    if (outV != NULL)
+    {
+        *outV =
+            transform.offset[1] -
+            sine * scaledU +
+            cosine * scaledV;
+    }
+}
+
+
+static BOOL RegisterTextureViewMapChannel(
+    const cgltf_primitive* primitive,
+    const cgltf_texture_view* textureView,
+    std::vector<MaxGLBBakedTextureChannel>* bakedChannels,
+    std::map<const cgltf_texture_view*, int>* textureViewChannels,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (textureView == NULL ||
+        textureView->texture == NULL)
+    {
+        return TRUE;
+    }
+
+    if (primitive == NULL ||
+        bakedChannels == NULL ||
+        textureViewChannels == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Invalid texture-transform import state."));
+        return FALSE;
+    }
+
+    const int sourceTexCoord =
+        GetEffectiveGltfTexCoord(
+            textureView);
+
+    if (sourceTexCoord < 0 ||
+        sourceTexCoord > 1)
+    {
+        _stprintf_s(
+            errorMessage,
+            errorMessageCount,
+            _T("A texture uses TEXCOORD_%d. MaxGLB2016 currently imports TEXCOORD_0 and TEXCOORD_1."),
+            sourceTexCoord);
+        return FALSE;
+    }
+
+    const cgltf_accessor* sourceAccessor =
+        cgltf_find_accessor(
+            primitive,
+            cgltf_attribute_type_texcoord,
+            sourceTexCoord);
+
+    if (sourceAccessor == NULL ||
+        sourceAccessor->type != cgltf_type_vec2 ||
+        sourceAccessor->is_sparse)
+    {
+        _stprintf_s(
+            errorMessage,
+            errorMessageCount,
+            _T("A material references TEXCOORD_%d, but the primitive has no compatible UV accessor."),
+            sourceTexCoord);
+        return FALSE;
+    }
+
+    if (!HasNonDefaultGltfTextureTransform(
+            textureView))
+    {
+        (*textureViewChannels)[textureView] =
+            sourceTexCoord + 1;
+
+        return TRUE;
+    }
+
+    MaxGLBBakedTextureChannel candidate;
+
+    candidate.sourceTexCoord =
+        sourceTexCoord;
+
+    candidate.offset[0] =
+        static_cast<float>(
+            textureView->transform.offset[0]);
+
+    candidate.offset[1] =
+        static_cast<float>(
+            textureView->transform.offset[1]);
+
+    candidate.scale[0] =
+        static_cast<float>(
+            textureView->transform.scale[0]);
+
+    candidate.scale[1] =
+        static_cast<float>(
+            textureView->transform.scale[1]);
+
+    candidate.rotation =
+        static_cast<float>(
+            textureView->transform.rotation);
+
+    for (size_t channelIndex = 0;
+         channelIndex < bakedChannels->size();
+         ++channelIndex)
+    {
+        if (BakedTextureChannelsMatch(
+                (*bakedChannels)[channelIndex],
+                candidate))
+        {
+            (*textureViewChannels)[textureView] =
+                (*bakedChannels)[channelIndex]
+                    .maxMapChannel;
+
+            return TRUE;
+        }
+    }
+
+    // Map channels 1 and 2 are reserved for the original glTF UV sets.
+    // 3ds Max supports many more channels, but keeping a conservative limit
+    // avoids relying on undocumented edge cases in the 2016 Mesh API.
+    const int newMapChannel =
+        3 + static_cast<int>(
+            bakedChannels->size());
+
+    if (newMapChannel > 99)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("The mesh requires too many unique texture transforms."));
+        return FALSE;
+    }
+
+    candidate.maxMapChannel =
+        newMapChannel;
+
+    bakedChannels->push_back(
+        candidate);
+
+    (*textureViewChannels)[textureView] =
+        newMapChannel;
+
+    return TRUE;
+}
+
+
+static BOOL RegisterMaterialTextureViewMapChannels(
+    const cgltf_primitive* primitive,
+    std::vector<MaxGLBBakedTextureChannel>* bakedChannels,
+    std::map<const cgltf_texture_view*, int>* textureViewChannels,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (primitive == NULL ||
+        primitive->material == NULL)
+    {
+        return TRUE;
+    }
+
+    const cgltf_material* material =
+        primitive->material;
+
+    if (material->has_pbr_metallic_roughness)
+    {
+        if (!RegisterTextureViewMapChannel(
+                primitive,
+                &material->pbr_metallic_roughness
+                    .base_color_texture,
+                bakedChannels,
+                textureViewChannels,
+                errorMessage,
+                errorMessageCount) ||
+            !RegisterTextureViewMapChannel(
+                primitive,
+                &material->pbr_metallic_roughness
+                    .metallic_roughness_texture,
+                bakedChannels,
+                textureViewChannels,
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
+    if (!RegisterTextureViewMapChannel(
+            primitive,
+            &material->normal_texture,
+            bakedChannels,
+            textureViewChannels,
+            errorMessage,
+            errorMessageCount) ||
+        !RegisterTextureViewMapChannel(
+            primitive,
+            &material->occlusion_texture,
+            bakedChannels,
+            textureViewChannels,
+            errorMessage,
+            errorMessageCount) ||
+        !RegisterTextureViewMapChannel(
+            primitive,
+            &material->emissive_texture,
+            bakedChannels,
+            textureViewChannels,
+            errorMessage,
+            errorMessageCount))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static void StoreMaxGLBTextureMetadata(
+    BitmapTex* bitmap,
+    const MaxGLBTextureMetadata& source)
+{
+    if (bitmap == NULL)
+    {
+        return;
+    }
+
+    bitmap->RemoveAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        TEXMAP_CLASS_ID,
+        MAXGLB_TEXTURE_METADATA_SUB_ID);
+
+    MaxGLBTextureMetadata* metadata =
+        static_cast<MaxGLBTextureMetadata*>(
+            MAX_malloc(
+                sizeof(MaxGLBTextureMetadata)));
+
+    if (metadata == NULL)
+    {
+        return;
+    }
+
+    *metadata =
+        source;
+
+    metadata->magic =
+        MAXGLB_TEXTURE_METADATA_MAGIC;
+
+    metadata->version =
+        MAXGLB_TEXTURE_METADATA_VERSION;
+
+    bitmap->AddAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        TEXMAP_CLASS_ID,
+        MAXGLB_TEXTURE_METADATA_SUB_ID,
+        static_cast<DWORD>(
+            sizeof(MaxGLBTextureMetadata)),
+        metadata);
+}
+
+
+static BOOL ReadMaxGLBTextureMetadata(
+    BitmapTex* bitmap,
+    MaxGLBTextureMetadata* output)
+{
+    if (output != NULL)
+    {
+        ZeroMemory(
+            output,
+            sizeof(MaxGLBTextureMetadata));
+    }
+
+    if (bitmap == NULL ||
+        output == NULL)
+    {
+        return FALSE;
+    }
+
+    AppDataChunk* chunk =
+        bitmap->GetAppDataChunk(
+            MAXGLB_IMPORTER_CLASS_ID,
+            TEXMAP_CLASS_ID,
+            MAXGLB_TEXTURE_METADATA_SUB_ID);
+
+    if (chunk == NULL ||
+        chunk->data == NULL ||
+        chunk->length <
+            sizeof(MaxGLBTextureMetadata))
+    {
+        return FALSE;
+    }
+
+    const MaxGLBTextureMetadata* metadata =
+        static_cast<const MaxGLBTextureMetadata*>(
+            chunk->data);
+
+    if (metadata->magic !=
+            MAXGLB_TEXTURE_METADATA_MAGIC ||
+        metadata->version !=
+            MAXGLB_TEXTURE_METADATA_VERSION)
+    {
+        return FALSE;
+    }
+
+    *output =
+        *metadata;
+
+    return TRUE;
+}
+
+
+static int GltfWrapModeToMaxTilingFlags(
+    int wrapS,
+    int wrapT)
+{
+    int flags = 0;
+
+    if (wrapS ==
+        static_cast<int>(
+            cgltf_wrap_mode_repeat))
+    {
+        flags |= U_WRAP;
+    }
+    else if (wrapS ==
+        static_cast<int>(
+            cgltf_wrap_mode_mirrored_repeat))
+    {
+        flags |= U_WRAP |
+            U_MIRROR;
+    }
+
+    if (wrapT ==
+        static_cast<int>(
+            cgltf_wrap_mode_repeat))
+    {
+        flags |= V_WRAP;
+    }
+    else if (wrapT ==
+        static_cast<int>(
+            cgltf_wrap_mode_mirrored_repeat))
+    {
+        flags |= V_WRAP |
+            V_MIRROR;
+    }
+
+    return flags;
+}
+
+
+static int MaxTilingFlagsToGltfWrapS(
+    int flags)
+{
+    if ((flags & U_MIRROR) != 0)
+    {
+        return static_cast<int>(
+            cgltf_wrap_mode_mirrored_repeat);
+    }
+
+    if ((flags & U_WRAP) != 0)
+    {
+        return static_cast<int>(
+            cgltf_wrap_mode_repeat);
+    }
+
+    return static_cast<int>(
+        cgltf_wrap_mode_clamp_to_edge);
+}
+
+
+static int MaxTilingFlagsToGltfWrapT(
+    int flags)
+{
+    if ((flags & V_MIRROR) != 0)
+    {
+        return static_cast<int>(
+            cgltf_wrap_mode_mirrored_repeat);
+    }
+
+    if ((flags & V_WRAP) != 0)
+    {
+        return static_cast<int>(
+            cgltf_wrap_mode_repeat);
+    }
+
+    return static_cast<int>(
+        cgltf_wrap_mode_clamp_to_edge);
+}
+
+
+static BOOL ApplyGltfTextureViewToBitmap(
+    BitmapTex* bitmap,
+    const cgltf_texture_view* textureView,
+    TimeValue timeValue)
+{
+    if (bitmap == NULL ||
+        textureView == NULL ||
+        textureView->texture == NULL)
+    {
+        return TRUE;
+    }
+
+    StdUVGen* uvGenerator =
+        bitmap->GetUVGen();
+
+    if (uvGenerator == NULL)
+    {
+        return FALSE;
+    }
+
+    float gltfOffsetX = 0.0f;
+    float gltfOffsetY = 0.0f;
+    float gltfScaleX = 1.0f;
+    float gltfScaleY = 1.0f;
+    float gltfRotation = 0.0f;
+
+    const int gltfTexCoord =
+        GetEffectiveGltfTexCoord(
+            textureView);
+
+    if (gltfTexCoord < 0 ||
+        gltfTexCoord > 1)
+    {
+        return FALSE;
+    }
+
+    if (textureView->has_transform)
+    {
+        gltfOffsetX =
+            static_cast<float>(
+                textureView->transform.offset[0]);
+
+        gltfOffsetY =
+            static_cast<float>(
+                textureView->transform.offset[1]);
+
+        gltfScaleX =
+            static_cast<float>(
+                textureView->transform.scale[0]);
+
+        gltfScaleY =
+            static_cast<float>(
+                textureView->transform.scale[1]);
+
+        gltfRotation =
+            static_cast<float>(
+                textureView->transform.rotation);
+    }
+
+    const cgltf_sampler* sampler =
+        textureView->texture->sampler;
+
+    const int wrapS =
+        sampler != NULL &&
+        sampler->wrap_s != 0
+        ? static_cast<int>(
+            sampler->wrap_s)
+        : GetDefaultGltfWrapMode();
+
+    const int wrapT =
+        sampler != NULL &&
+        sampler->wrap_t != 0
+        ? static_cast<int>(
+            sampler->wrap_t)
+        : GetDefaultGltfWrapMode();
+
+    const int minFilter =
+        sampler != NULL &&
+        sampler->min_filter != 0
+        ? static_cast<int>(
+            sampler->min_filter)
+        : GetDefaultGltfMinFilter();
+
+    const int magFilter =
+        sampler != NULL &&
+        sampler->mag_filter != 0
+        ? static_cast<int>(
+            sampler->mag_filter)
+        : GetDefaultGltfMagFilter();
+
+    int maxMapChannel =
+        gltfTexCoord + 1;
+
+    const std::map<
+        const cgltf_texture_view*,
+        int>::const_iterator channelIterator =
+            g_activeImportTextureViewMapChannels.find(
+                textureView);
+
+    if (channelIterator !=
+        g_activeImportTextureViewMapChannels.end())
+    {
+        maxMapChannel =
+            channelIterator->second;
+    }
+    else if (HasNonDefaultGltfTextureTransform(
+                 textureView))
+    {
+        // A non-default glTF transform must have been baked into the mesh
+        // before the material is created. Falling back to StdUVGen would
+        // reintroduce Max's different pivot/order semantics.
+        return FALSE;
+    }
+
+    uvGenerator->SetUseRealWorldScale(
+        FALSE);
+
+    uvGenerator->SetMapChannel(
+        maxMapChannel);
+
+    // KHR_texture_transform is already baked into maxMapChannel. Keep the
+    // legacy Bitmap coordinates at identity so both viewport and renderer
+    // read the exact transformed UVs.
+    uvGenerator->SetUScl(
+        1.0f,
+        timeValue);
+
+    uvGenerator->SetVScl(
+        1.0f,
+        timeValue);
+
+    uvGenerator->SetUOffs(
+        0.0f,
+        timeValue);
+
+    uvGenerator->SetVOffs(
+        0.0f,
+        timeValue);
+
+    uvGenerator->SetWAng(
+        0.0f,
+        timeValue);
+
+    const int maxTiling =
+        GltfWrapModeToMaxTilingFlags(
+            wrapS,
+            wrapT);
+
+    uvGenerator->SetTextureTiling(
+        maxTiling);
+
+    MaxGLBTextureMetadata metadata;
+    ZeroMemory(
+        &metadata,
+        sizeof(metadata));
+
+    metadata.magic =
+        MAXGLB_TEXTURE_METADATA_MAGIC;
+
+    metadata.version =
+        MAXGLB_TEXTURE_METADATA_VERSION;
+
+    metadata.offset[0] =
+        gltfOffsetX;
+
+    metadata.offset[1] =
+        gltfOffsetY;
+
+    metadata.scale[0] =
+        gltfScaleX;
+
+    metadata.scale[1] =
+        gltfScaleY;
+
+    metadata.rotation =
+        gltfRotation;
+
+    metadata.texCoord =
+        gltfTexCoord;
+
+    metadata.wrapS =
+        wrapS;
+
+    metadata.wrapT =
+        wrapT;
+
+    metadata.minFilter =
+        minFilter;
+
+    metadata.magFilter =
+        magFilter;
+
+    metadata.maxUOffset =
+        0.0f;
+
+    metadata.maxVOffset =
+        0.0f;
+
+    metadata.maxUScale =
+        1.0f;
+
+    metadata.maxVScale =
+        1.0f;
+
+    metadata.maxWAngle =
+        0.0f;
+
+    metadata.maxMapChannel =
+        maxMapChannel;
+
+    metadata.maxTextureTiling =
+        maxTiling;
+
+    StoreMaxGLBTextureMetadata(
+        bitmap,
+        metadata);
+
+    bitmap->NotifyDependents(
+        FOREVER,
+        PART_ALL,
+        REFMSG_CHANGE);
+
+    return TRUE;
+}
 
 
 struct MaxGLBAlphaMetadata
@@ -2805,6 +3638,21 @@ static BOOL CreateStandardMaterialForPrimitive(
                 return FALSE;
             }
 
+            if (!ApplyGltfTextureViewToBitmap(
+                    baseColorBitmap,
+                    &baseColorView,
+                    timeValue))
+            {
+                baseColorBitmap->DeleteThis();
+                maxMaterial->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("The base-color texture coordinates could not be configured."));
+                return FALSE;
+            }
+
             maxMaterial->SetActiveTexmap(
                 baseColorBitmap);
 
@@ -2877,6 +3725,20 @@ static BOOL CreateStandardMaterialForPrimitive(
                         return FALSE;
                     }
 
+                    if (!ApplyGltfTextureViewToBitmap(
+                            opacityBitmap,
+                            &baseColorView,
+                            timeValue))
+                    {
+                        maxMaterial->DeleteThis();
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("The opacity texture coordinates could not be configured."));
+                        return FALSE;
+                    }
+
                     StoreMaxGLBAlphaMetadata(
                         maxMaterial,
                         importedAlphaMode,
@@ -2918,6 +3780,21 @@ static BOOL CreateStandardMaterialForPrimitive(
                 errorMessage,
                 errorMessageCount,
                 _T("The normal texture bitmap could not be created."));
+            return FALSE;
+        }
+
+        if (!ApplyGltfTextureViewToBitmap(
+                normalBitmap,
+                &gltfMaterial->normal_texture,
+                timeValue))
+        {
+            normalBitmap->DeleteThis();
+            maxMaterial->DeleteThis();
+
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The normal texture coordinates could not be configured."));
             return FALSE;
         }
 
@@ -3044,6 +3921,41 @@ static BOOL CreateStandardMaterialForPrimitive(
             return FALSE;
         }
 
+        const cgltf_texture_view* metallicRoughnessView =
+            gltfMaterial->has_pbr_metallic_roughness &&
+            gltfMaterial->pbr_metallic_roughness
+                .metallic_roughness_texture.texture != NULL
+            ? &gltfMaterial->pbr_metallic_roughness
+                .metallic_roughness_texture
+            : ormTextureView;
+
+        const cgltf_texture_view* occlusionView =
+            gltfMaterial->occlusion_texture.texture != NULL
+            ? &gltfMaterial->occlusion_texture
+            : ormTextureView;
+
+        if (!ApplyGltfTextureViewToBitmap(
+                occlusionBitmap,
+                occlusionView,
+                timeValue) ||
+            !ApplyGltfTextureViewToBitmap(
+                glossinessBitmap,
+                metallicRoughnessView,
+                timeValue) ||
+            !ApplyGltfTextureViewToBitmap(
+                metallicBitmap,
+                metallicRoughnessView,
+                timeValue))
+        {
+            maxMaterial->DeleteThis();
+
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The ORM texture coordinates could not be configured."));
+            return FALSE;
+        }
+
         if (!AssignStdMaterialMap(
                 maxMaterial,
                 ID_AM,
@@ -3098,6 +4010,22 @@ static BOOL CreateStandardMaterialForPrimitive(
             CreateBitmapTexture(
                 _T("MaxGLB2016_Emissive_0"),
                 emissivePath);
+
+        if (emissiveBitmap != NULL &&
+            !ApplyGltfTextureViewToBitmap(
+                emissiveBitmap,
+                &gltfMaterial->emissive_texture,
+                timeValue))
+        {
+            emissiveBitmap->DeleteThis();
+            maxMaterial->DeleteThis();
+
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The emissive texture coordinates could not be configured."));
+            return FALSE;
+        }
 
         if (emissiveBitmap == NULL ||
             !AssignStdMaterialMap(
@@ -3206,6 +4134,7 @@ struct MaxGLBImportStats
     BOOL createdParentNode;
 
     std::vector<INode*> createdNodes;
+    std::vector<INode*> hierarchyRootNodes;
 
     MaxGLBImportStats()
         : objectCount(0)
@@ -3283,6 +4212,7 @@ static void ConvertUtf8ToTchar(
 #define MAXGLB_ID_PREVIEW_ROTATE_LEFT  4116
 #define MAXGLB_ID_PREVIEW_ROTATE_RIGHT 4117
 #define MAXGLB_ID_PREVIEW_ROTATE_RESET 4118
+#define MAXGLB_ID_PRESERVE_HIERARCHY    4119
 
 
 #define MAXGLB_ID_EXPORT_SCALE             4201
@@ -3298,6 +4228,8 @@ static void ConvertUtf8ToTchar(
 #define MAXGLB_ID_EXPORT_CONFIRM           4211
 #define MAXGLB_ID_EXPORT_ALPHA_MODE        4212
 #define MAXGLB_ID_EXPORT_ALPHA_CUTOFF      4213
+#define MAXGLB_ID_EXPORT_TRANSFORM_MODE     4214
+#define MAXGLB_ID_EXPORT_HIERARCHY          4215
 
 
 struct MaxGLBImportDialogContext
@@ -3312,6 +4244,7 @@ struct MaxGLBImportDialogContext
     HWND previewRotateResetButton;
     HWND importTexturesCheck;
     HWND addParentCheck;
+    HWND preserveHierarchyCheck;
     HWND normalizeSizeCheck;
     HWND normalizeTargetEdit;
     HWND animationCheck;
@@ -3338,6 +4271,7 @@ struct MaxGLBImportDialogContext
         , previewRotateResetButton(NULL)
         , importTexturesCheck(NULL)
         , addParentCheck(NULL)
+        , preserveHierarchyCheck(NULL)
         , normalizeSizeCheck(NULL)
         , normalizeTargetEdit(NULL)
         , animationCheck(NULL)
@@ -3410,6 +4344,7 @@ static BOOL IsImportCheckboxId(
 {
     return controlId == MAXGLB_ID_IMPORT_TEXTURES ||
         controlId == MAXGLB_ID_ADD_PARENT ||
+        controlId == MAXGLB_ID_PRESERVE_HIERARCHY ||
         controlId == MAXGLB_ID_NORMALIZE_SIZE ||
         controlId == MAXGLB_ID_IMPORT_ANIMATION;
 }
@@ -5714,6 +6649,30 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 NULL,
                 TRUE);
 
+            context->preserveHierarchyCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Preserve GLB hierarchy and pivots"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    180,
+                    310,
+                    250,
+                    24,
+                    window,
+                    MAXGLB_ID_PRESERVE_HIERARCHY,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->preserveHierarchyCheck);
+
+            SetImportCheckboxState(
+                context->preserveHierarchyCheck,
+                context->settings.preserveHierarchy);
+
             context->normalizeSizeCheck =
                 CreateImportControl(
                     0,
@@ -5724,7 +6683,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     180,
-                    310,
+                    340,
                     205,
                     24,
                     window,
@@ -5755,7 +6714,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     WS_TABSTOP |
                     ES_AUTOHSCROLL,
                     395,
-                    310,
+                    340,
                     80,
                     24,
                     window,
@@ -5776,7 +6735,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 WS_CHILD |
                 WS_VISIBLE,
                 482,
-                315,
+                345,
                 70,
                 20,
                 window,
@@ -5792,7 +6751,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     WS_VISIBLE |
                     BS_OWNERDRAW,
                     180,
-                    340,
+                    370,
                     230,
                     24,
                     window,
@@ -5824,7 +6783,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 WS_VISIBLE |
                 SS_LEFT,
                 180,
-                370,
+                400,
                 470,
                 38,
                 window,
@@ -5840,7 +6799,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 WS_TABSTOP |
                 BS_OWNERDRAW,
                 16,
-                415,
+                445,
                 80,
                 28,
                 window,
@@ -5856,7 +6815,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 WS_TABSTOP |
                 BS_OWNERDRAW,
                 505,
-                415,
+                445,
                 80,
                 28,
                 window,
@@ -5873,7 +6832,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     595,
-                    415,
+                    445,
                     80,
                     28,
                     window,
@@ -6187,7 +7146,8 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     _T("MaxGLB2016 imports static triangle meshes for editing and optimization in 3ds Max 2016.\n\n")
                     _T("The preview uses the 3ds Max Front view: X is horizontal, Z+ points upward, and the camera looks along -Y.\n\n")
                     _T("The four arrow buttons rotate both the preview and the final imported model in exact 90-degree steps. Up/down rotate around Max X; left/right rotate around Max Z. The center 0 button restores the standard orientation.\n\n")
-                    _T("When Add parent node is enabled, all created mesh nodes are attached below a Dummy helper named Root:NAME.\n\n")
+                    _T("Preserve hierarchy creates Max parent-child links, retains glTF pivots, and creates Dummy helpers for empty glTF nodes. When disabled, transforms are baked into geometry as before.\n\n")
+                    _T("Add parent node optionally wraps the imported source roots below a new Dummy helper named Root:NAME without flattening the source hierarchy.\n\n")
                     _T("Normalize size scales the complete imported model uniformly so its largest world-space dimension equals the entered Max-unit value.\n\n")
                     _T("Animation is intentionally outside the current static-model workflow."),
                     _T("MaxGLB2016 Import Information"),
@@ -6215,6 +7175,10 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     context->importableObjectCount > 1 &&
                     GetImportCheckboxState(
                         context->addParentCheck);
+
+                context->settings.preserveHierarchy =
+                    GetImportCheckboxState(
+                        context->preserveHierarchyCheck);
 
                 context->settings.normalizeSize =
                     GetImportCheckboxState(
@@ -6393,7 +7357,7 @@ static BOOL ShowMaxGLBImportOptions(
         context.previewPoints);
 
     const int clientWidth = 700;
-    const int clientHeight = 460;
+    const int clientHeight = 490;
 
     RECT windowRect =
     {
@@ -6572,6 +7536,8 @@ struct MaxGLBExportDialogContext
     HWND scaleEdit;
     HWND normalizeCheck;
     HWND normalizeTargetEdit;
+    HWND transformModeCombo;
+    HWND hierarchyCheck;
     HWND materialsCheck;
     HWND texturesCheck;
     HWND alphaModeCombo;
@@ -6594,6 +7560,8 @@ struct MaxGLBExportDialogContext
         , scaleEdit(NULL)
         , normalizeCheck(NULL)
         , normalizeTargetEdit(NULL)
+        , transformModeCombo(NULL)
+        , hierarchyCheck(NULL)
         , materialsCheck(NULL)
         , texturesCheck(NULL)
         , alphaModeCombo(NULL)
@@ -6614,6 +7582,7 @@ static BOOL IsExportCheckboxId(
     int controlId)
 {
     return controlId == MAXGLB_ID_EXPORT_NORMALIZE ||
+        controlId == MAXGLB_ID_EXPORT_HIERARCHY ||
         controlId == MAXGLB_ID_EXPORT_MATERIALS ||
         controlId == MAXGLB_ID_EXPORT_TEXTURES ||
         controlId == MAXGLB_ID_EXPORT_SUMMARY ||
@@ -6650,6 +7619,36 @@ static void UpdateExportDialogEnabledState(
     EnableWindow(
         context->normalizeTargetEdit,
         normalizeEnabled);
+
+    const int selectedTransformMode =
+        context->transformModeCombo != NULL
+        ? static_cast<int>(
+            SendMessage(
+                context->transformModeCombo,
+                CB_GETCURSEL,
+                0,
+                0))
+        : MAXGLB_TRANSFORM_BAKE;
+
+    const BOOL hierarchyEnabled =
+        selectedTransformMode ==
+            MAXGLB_TRANSFORM_PRESERVE;
+
+    EnableWindow(
+        context->hierarchyCheck,
+        hierarchyEnabled);
+
+    if (!hierarchyEnabled)
+    {
+        SetImportCheckboxState(
+            context->hierarchyCheck,
+            FALSE);
+    }
+
+    InvalidateRect(
+        context->hierarchyCheck,
+        NULL,
+        TRUE);
 
     const BOOL materialsEnabled =
         GetImportCheckboxState(
@@ -6922,11 +7921,101 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
             CreateImportControl(
                 0,
                 _T("STATIC"),
-                _T("Materials"),
+                _T("Transforms and pivots"),
                 WS_CHILD |
                 WS_VISIBLE,
                 16,
                 176,
+                220,
+                20,
+                window,
+                -1,
+                NULL);
+
+            context->transformModeCombo =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("COMBOBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    CBS_DROPDOWNLIST |
+                    WS_VSCROLL,
+                    27,
+                    202,
+                    300,
+                    100,
+                    window,
+                    MAXGLB_ID_EXPORT_TRANSFORM_MODE,
+                    NULL);
+
+            SendMessage(
+                context->transformModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Bake transforms into geometry")));
+
+            SendMessage(
+                context->transformModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Preserve transforms and pivots")));
+
+            SendMessage(
+                context->transformModeCombo,
+                CB_SETCURSEL,
+                context->settings.transformMode,
+                0);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Preserve keeps local mesh coordinates and writes each Max pivot/world transform as a glTF node matrix."),
+                WS_CHILD |
+                WS_VISIBLE,
+                27,
+                232,
+                485,
+                32,
+                window,
+                -1,
+                NULL);
+
+            context->hierarchyCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Preserve parent-child hierarchy"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    264,
+                    260,
+                    24,
+                    window,
+                    MAXGLB_ID_EXPORT_HIERARCHY,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->hierarchyCheck);
+
+            SetImportCheckboxState(
+                context->hierarchyCheck,
+                context->settings.preserveHierarchy);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Materials"),
+                WS_CHILD |
+                WS_VISIBLE,
+                16,
+                300,
                 180,
                 20,
                 window,
@@ -6943,7 +8032,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     27,
-                    204,
+                    328,
                     250,
                     26,
                     window,
@@ -6964,7 +8053,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     27,
-                    234,
+                    358,
                     300,
                     26,
                     window,
@@ -6982,7 +8071,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_CHILD |
                 WS_VISIBLE,
                 315,
-                176,
+                300,
                 190,
                 20,
                 window,
@@ -7000,7 +8089,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     CBS_DROPDOWNLIST |
                     WS_VSCROLL,
                     315,
-                    202,
+                    326,
                     200,
                     120,
                     window,
@@ -7048,7 +8137,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_CHILD |
                 WS_VISIBLE,
                 315,
-                234,
+                358,
                 90,
                 20,
                 window,
@@ -7073,7 +8162,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_TABSTOP |
                     ES_AUTOHSCROLL,
                     410,
-                    231,
+                    355,
                     80,
                     24,
                     window,
@@ -7090,7 +8179,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_CHILD |
                 WS_VISIBLE,
                 28,
-                266,
+                390,
                 470,
                 36,
                 window,
@@ -7104,7 +8193,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_CHILD |
                 WS_VISIBLE,
                 16,
-                312,
+                436,
                 180,
                 20,
                 window,
@@ -7121,7 +8210,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     27,
-                    338,
+                    462,
                     230,
                     26,
                     window,
@@ -7142,7 +8231,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_TABSTOP |
                     BS_OWNERDRAW,
                     27,
-                    368,
+                    492,
                     330,
                     26,
                     window,
@@ -7162,7 +8251,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     WS_VISIBLE |
                     BS_OWNERDRAW,
                     27,
-                    398,
+                    522,
                     300,
                     26,
                     window,
@@ -7186,7 +8275,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_TABSTOP |
                 BS_OWNERDRAW,
                 16,
-                442,
+                566,
                 80,
                 29,
                 window,
@@ -7202,7 +8291,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_TABSTOP |
                 BS_OWNERDRAW,
                 350,
-                442,
+                566,
                 80,
                 29,
                 window,
@@ -7218,7 +8307,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 WS_TABSTOP |
                 BS_OWNERDRAW,
                 440,
-                442,
+                566,
                 80,
                 29,
                 window,
@@ -7352,6 +8441,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 HIWORD(wordParameter);
 
             if ((controlId == MAXGLB_ID_EXPORT_NORMALIZE ||
+                 controlId == MAXGLB_ID_EXPORT_HIERARCHY ||
                  controlId == MAXGLB_ID_EXPORT_MATERIALS ||
                  controlId == MAXGLB_ID_EXPORT_TEXTURES ||
                  controlId == MAXGLB_ID_EXPORT_SUMMARY ||
@@ -7377,6 +8467,14 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 return 0;
             }
 
+            if (controlId == MAXGLB_ID_EXPORT_TRANSFORM_MODE &&
+                notificationCode == CBN_SELCHANGE)
+            {
+                UpdateExportDialogEnabledState(
+                    context);
+                return 0;
+            }
+
             if (controlId == MAXGLB_ID_EXPORT_ALPHA_MODE &&
                 notificationCode == CBN_SELCHANGE)
             {
@@ -7390,7 +8488,8 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 MessageBox(
                     window,
                     _T("MaxGLB2016 exports static models for editing, optimization and arrangement workflows.\n\n")
-                    _T("Uniform scale multiplies all baked world-space positions. Normalize instead scales the complete export uniformly so its largest dimension matches the requested Max-unit value.\n\n")
+                    _T("Uniform scale and Normalize affect the complete export in world space.\n\n")
+                    _T("Bake transforms writes world-space geometry exactly like earlier versions. Preserve transforms keeps mesh coordinates local and keeps each Max pivot as the glTF node origin. Preserve hierarchy additionally exports Dummy/helper parent nodes and local parent-child transforms.\n\n")
                     _T("GLB stores all enabled textures inside the output file. Standard material colors and opacity can still be exported when texture export is disabled.\n\n")
                     _T("Alpha Auto preserves OPAQUE, BLEND, MASK and alphaCutoff from imported GLB materials. For manually created Max materials it chooses BLEND when opacity is present, otherwise OPAQUE. MASK can be forced with a custom cutoff.\n\n")
                     _T("Animation is intentionally outside the current static-model workflow."),
@@ -7468,6 +8567,32 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                         MB_OK |
                         MB_ICONWARNING);
                     return 0;
+                }
+
+                context->settings.transformMode =
+                    static_cast<int>(
+                        SendMessage(
+                            context->transformModeCombo,
+                            CB_GETCURSEL,
+                            0,
+                            0));
+
+                context->settings.preserveHierarchy =
+                    context->settings.transformMode ==
+                        MAXGLB_TRANSFORM_PRESERVE &&
+                    GetImportCheckboxState(
+                        context->hierarchyCheck);
+
+                if (context->settings.transformMode !=
+                        MAXGLB_TRANSFORM_BAKE &&
+                    context->settings.transformMode !=
+                        MAXGLB_TRANSFORM_PRESERVE)
+                {
+                    context->settings.transformMode =
+                        MAXGLB_TRANSFORM_BAKE;
+
+                    context->settings.preserveHierarchy =
+                        FALSE;
                 }
 
                 context->settings.scaleFactor =
@@ -7618,7 +8743,7 @@ static BOOL ShowMaxGLBExportOptions(
         *settings;
 
     const int clientWidth = 536;
-    const int clientHeight = 486;
+    const int clientHeight = 610;
 
     RECT windowRect =
     {
@@ -8027,6 +9152,62 @@ static BOOL ImportPrimitiveAsNode(
         hasUvChannel = TRUE;
     }
 
+    const cgltf_accessor* texCoord1Accessor =
+        cgltf_find_accessor(
+            primitive,
+            cgltf_attribute_type_texcoord,
+            1);
+
+    BOOL hasUvChannel1 = FALSE;
+
+    if (texCoord1Accessor != NULL)
+    {
+        if (texCoord1Accessor->type != cgltf_type_vec2)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("TEXCOORD_1 is present but is not a two-component accessor."));
+            return FALSE;
+        }
+
+        if (texCoord1Accessor->count != positionAccessor->count)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("TEXCOORD_1 and POSITION contain different vertex counts."));
+            return FALSE;
+        }
+
+        if (texCoord1Accessor->is_sparse)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("Sparse TEXCOORD_1 accessors are not supported yet."));
+            return FALSE;
+        }
+
+        hasUvChannel1 = TRUE;
+    }
+
+    std::vector<MaxGLBBakedTextureChannel>
+        bakedTextureChannels;
+
+    std::map<const cgltf_texture_view*, int>
+        textureViewMapChannels;
+
+    if (!RegisterMaterialTextureViewMapChannels(
+            primitive,
+            &bakedTextureChannels,
+            &textureViewMapChannels,
+            errorMessage,
+            errorMessageCount))
+    {
+        return FALSE;
+    }
+
     const cgltf_accessor* normalAccessor =
         cgltf_find_accessor(
             primitive,
@@ -8111,7 +9292,11 @@ static BOOL ImportPrimitiveAsNode(
         0.0f, 0.0f, 0.0f, 1.0f
     };
 
-    if (sourceNode != NULL)
+    const BOOL preserveSourceHierarchy =
+        g_activeImportSettings.preserveHierarchy;
+
+    if (sourceNode != NULL &&
+        !preserveSourceHierarchy)
     {
         BuildGltfWorldMatrix(
             data,
@@ -8160,15 +9345,28 @@ static BOOL ImportPrimitiveAsNode(
 
         cgltf_float worldPosition[3];
 
-        TransformGltfPoint(
-            gltfWorld,
-            localPosition[0],
-            localPosition[1],
-            localPosition[2],
-            worldPosition);
+        if (preserveSourceHierarchy)
+        {
+            worldPosition[0] = localPosition[0];
+            worldPosition[1] = localPosition[1];
+            worldPosition[2] = localPosition[2];
+        }
+        else
+        {
+            TransformGltfPoint(
+                gltfWorld,
+                localPosition[0],
+                localPosition[1],
+                localPosition[2],
+                worldPosition);
+        }
 
         Point3 maxPosition =
-            ConvertGltfLocalPositionToMax(
+            preserveSourceHierarchy
+            ? ConvertGltfPositionToMax(
+                worldPosition,
+                NULL)
+            : ConvertGltfLocalPositionToMax(
                 worldPosition);
 
         MaxGLBPositionKey key(maxPosition);
@@ -8242,6 +9440,48 @@ static BOOL ImportPrimitiveAsNode(
 
         maxMesh.setNumTVFaces(
             static_cast<int>(faceCount));
+    }
+
+    if (hasUvChannel1)
+    {
+        maxMesh.setMapSupport(
+            2,
+            TRUE);
+
+        maxMesh.setNumMapVerts(
+            2,
+            static_cast<int>(
+                texCoord1Accessor->count));
+
+        maxMesh.setNumMapFaces(
+            2,
+            static_cast<int>(
+                faceCount));
+    }
+
+    for (size_t bakedChannelIndex = 0;
+         bakedChannelIndex <
+            bakedTextureChannels.size();
+         ++bakedChannelIndex)
+    {
+        const int mapChannel =
+            bakedTextureChannels[
+                bakedChannelIndex]
+                .maxMapChannel;
+
+        maxMesh.setMapSupport(
+            mapChannel,
+            TRUE);
+
+        maxMesh.setNumMapVerts(
+            mapChannel,
+            static_cast<int>(
+                positionAccessor->count));
+
+        maxMesh.setNumMapFaces(
+            mapChannel,
+            static_cast<int>(
+                faceCount));
     }
 
     MeshNormalSpec* specifiedNormals = NULL;
@@ -8320,6 +9560,104 @@ static BOOL ImportPrimitiveAsNode(
                     0.0f);
         }
 
+        if (hasUvChannel1)
+        {
+            cgltf_float texCoord1[2];
+
+            if (!cgltf_accessor_read_float(
+                    texCoord1Accessor,
+                    sourceVertexIndex,
+                    texCoord1,
+                    2))
+            {
+                triObject->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A TEXCOORD_1 value could not be read."));
+                return FALSE;
+            }
+
+            maxMesh.setMapVert(
+                2,
+                static_cast<int>(
+                    sourceVertexIndex),
+                UVVert(
+                    static_cast<float>(
+                        texCoord1[0]),
+                    static_cast<float>(
+                        1.0f -
+                        texCoord1[1]),
+                    0.0f));
+        }
+
+        for (size_t bakedChannelIndex = 0;
+             bakedChannelIndex <
+                bakedTextureChannels.size();
+             ++bakedChannelIndex)
+        {
+            const MaxGLBBakedTextureChannel&
+                bakedChannel =
+                    bakedTextureChannels[
+                        bakedChannelIndex];
+
+            const cgltf_accessor* sourceUvAccessor =
+                bakedChannel.sourceTexCoord == 0
+                ? texCoordAccessor
+                : texCoord1Accessor;
+
+            if (sourceUvAccessor == NULL)
+            {
+                triObject->DeleteThis();
+
+                _stprintf_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A baked texture transform requires TEXCOORD_%d, but the primitive does not contain it."),
+                    bakedChannel.sourceTexCoord);
+                return FALSE;
+            }
+
+            cgltf_float sourceUv[2];
+
+            if (!cgltf_accessor_read_float(
+                    sourceUvAccessor,
+                    sourceVertexIndex,
+                    sourceUv,
+                    2))
+            {
+                triObject->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A texture coordinate could not be read while baking KHR_texture_transform."));
+                return FALSE;
+            }
+
+            float transformedU = 0.0f;
+            float transformedV = 0.0f;
+
+            ApplyGltfTextureTransformToUv(
+                bakedChannel,
+                static_cast<float>(
+                    sourceUv[0]),
+                static_cast<float>(
+                    sourceUv[1]),
+                &transformedU,
+                &transformedV);
+
+            maxMesh.setMapVert(
+                bakedChannel.maxMapChannel,
+                static_cast<int>(
+                    sourceVertexIndex),
+                UVVert(
+                    transformedU,
+                    1.0f - transformedV,
+                    0.0f));
+        }
+
         if (hasNormals)
         {
             cgltf_float sourceNormal[3];
@@ -8341,7 +9679,11 @@ static BOOL ImportPrimitiveAsNode(
 
             specifiedNormals->Normal(
                 static_cast<int>(sourceVertexIndex)) =
-                TransformGltfNormalToMaxWorld(
+                preserveSourceHierarchy
+                ? ConvertGltfNormalToMax(
+                    sourceNormal,
+                    NULL)
+                : TransformGltfNormalToMaxWorld(
                     gltfWorld,
                     sourceNormal);
 
@@ -8435,6 +9777,71 @@ static BOOL ImportPrimitiveAsNode(
                     static_cast<int>(sourceIndex2));
         }
 
+        if (hasUvChannel1)
+        {
+            TVFace* mapFaces2 =
+                maxMesh.mapFaces(2);
+
+            if (mapFaces2 == NULL)
+            {
+                triObject->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("3ds Max could not access UV channel 2 faces."));
+                return FALSE;
+            }
+
+            mapFaces2[
+                static_cast<int>(
+                    faceIndex)]
+                .setTVerts(
+                    static_cast<int>(
+                        sourceIndex0),
+                    static_cast<int>(
+                        sourceIndex1),
+                    static_cast<int>(
+                        sourceIndex2));
+        }
+
+        for (size_t bakedChannelIndex = 0;
+             bakedChannelIndex <
+                bakedTextureChannels.size();
+             ++bakedChannelIndex)
+        {
+            const int mapChannel =
+                bakedTextureChannels[
+                    bakedChannelIndex]
+                    .maxMapChannel;
+
+            TVFace* bakedMapFaces =
+                maxMesh.mapFaces(
+                    mapChannel);
+
+            if (bakedMapFaces == NULL)
+            {
+                triObject->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("3ds Max could not access a baked texture-transform map channel."));
+                return FALSE;
+            }
+
+            bakedMapFaces[
+                static_cast<int>(
+                    faceIndex)]
+                .setTVerts(
+                    static_cast<int>(
+                        sourceIndex0),
+                    static_cast<int>(
+                        sourceIndex1),
+                    static_cast<int>(
+                        sourceIndex2));
+        }
+
         if (hasNormals)
         {
             MeshNormalFace& normalFace =
@@ -8496,6 +9903,9 @@ static BOOL ImportPrimitiveAsNode(
         return FALSE;
     }
 
+    g_activeImportTextureViewMapChannels =
+        textureViewMapChannels;
+
     if (!CreateStandardMaterialForPrimitive(
             primitive,
             sourceFilename,
@@ -8531,12 +9941,19 @@ static BOOL ImportPrimitiveAsNode(
         return FALSE;
     }
 
-    // The complete glTF world transform has already been baked into the
-    // positions and normals. Keeping the Max node transform at identity
-    // avoids an additional or incorrectly converted axis rotation.
-    maxNode->SetNodeTM(
-        maxInterface->GetTime(),
-        Matrix3(1));
+    if (preserveSourceHierarchy)
+    {
+        maxNode->SetNodeTM(
+            maxInterface->GetTime(),
+            BuildMaxNodeTransform(
+                sourceNode));
+    }
+    else
+    {
+        maxNode->SetNodeTM(
+            maxInterface->GetTime(),
+            Matrix3(1));
+    }
 
     TCHAR importedNodeName[256];
 
@@ -8571,7 +9988,8 @@ static BOOL ImportPrimitiveAsNode(
         static_cast<int>(
             faceCount);
 
-    if (hasUvChannel)
+    if (hasUvChannel ||
+        hasUvChannel1)
     {
         ++importStats->objectsWithUv;
     }
@@ -8635,16 +10053,19 @@ struct MaxGLBPrimitiveImportInfo
 
     const cgltf_accessor* positions;
     const cgltf_accessor* texcoords;
+    const cgltf_accessor* texcoords1;
     const cgltf_accessor* normals;
 
     cgltf_size faceCount;
 
     size_t uvBase;
+    size_t uv1Base;
     size_t normalBase;
 
     int materialId;
 
     BOOL hasUv;
+    BOOL hasUv1;
     BOOL hasNormals;
 
     std::vector<int> sourceToWelded;
@@ -8653,12 +10074,15 @@ struct MaxGLBPrimitiveImportInfo
         : primitive(NULL)
         , positions(NULL)
         , texcoords(NULL)
+        , texcoords1(NULL)
         , normals(NULL)
         , faceCount(0)
         , uvBase(0)
+        , uv1Base(0)
         , normalBase(0)
         , materialId(0)
         , hasUv(FALSE)
+        , hasUv1(FALSE)
         , hasNormals(FALSE)
     {
     }
@@ -8724,6 +10148,12 @@ static BOOL ImportMeshPrimitivesAsNode(
 
     std::vector<MaxGLBPrimitiveImportInfo> primitiveInfos;
 
+    std::vector<MaxGLBBakedTextureChannel>
+        bakedTextureChannels;
+
+    std::map<const cgltf_texture_view*, int>
+        textureViewMapChannels;
+
     primitiveInfos.reserve(
         static_cast<size_t>(
             sourceMesh->primitives_count));
@@ -8732,6 +10162,7 @@ static BOOL ImportMeshPrimitivesAsNode(
     size_t totalSourceVertexCount = 0;
 
     BOOL anyUv = FALSE;
+    BOOL anyUv1 = FALSE;
     BOOL allHaveNormals = TRUE;
 
     for (cgltf_size sourcePrimitiveIndex = 0;
@@ -8786,6 +10217,12 @@ static BOOL ImportMeshPrimitivesAsNode(
                 cgltf_attribute_type_texcoord,
                 0);
 
+        info.texcoords1 =
+            cgltf_find_accessor(
+                primitive,
+                cgltf_attribute_type_texcoord,
+                1);
+
         info.normals =
             cgltf_find_accessor(
                 primitive,
@@ -8794,6 +10231,9 @@ static BOOL ImportMeshPrimitivesAsNode(
 
         info.hasUv =
             info.texcoords != NULL;
+
+        info.hasUv1 =
+            info.texcoords1 != NULL;
 
         info.hasNormals =
             info.normals != NULL;
@@ -8815,6 +10255,35 @@ static BOOL ImportMeshPrimitivesAsNode(
 
             anyUv =
                 TRUE;
+        }
+
+        if (info.hasUv1)
+        {
+            if (info.texcoords1->type !=
+                    cgltf_type_vec2 ||
+                info.texcoords1->count !=
+                    positions->count ||
+                info.texcoords1->is_sparse)
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A multi-primitive mesh contains incompatible TEXCOORD_1 data."));
+                return FALSE;
+            }
+
+            anyUv1 =
+                TRUE;
+        }
+
+        if (!RegisterMaterialTextureViewMapChannels(
+                primitive,
+                &bakedTextureChannels,
+                &textureViewMapChannels,
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
         }
 
         if (info.hasNormals)
@@ -8904,6 +10373,9 @@ static BOOL ImportMeshPrimitivesAsNode(
         info.uvBase =
             totalSourceVertexCount;
 
+        info.uv1Base =
+            totalSourceVertexCount;
+
         info.normalBase =
             totalSourceVertexCount;
 
@@ -8971,10 +10443,16 @@ static BOOL ImportMeshPrimitivesAsNode(
         0.0f, 0.0f, 0.0f, 1.0f
     };
 
-    BuildGltfWorldMatrix(
-        data,
-        sourceNode,
-        gltfWorld);
+    const BOOL preserveSourceHierarchy =
+        g_activeImportSettings.preserveHierarchy;
+
+    if (!preserveSourceHierarchy)
+    {
+        BuildGltfWorldMatrix(
+            data,
+            sourceNode,
+            gltfWorld);
+    }
 
     std::vector<Point3> weldedPositions;
     std::map<MaxGLBPositionKey, int> weldedLookup;
@@ -9025,15 +10503,28 @@ static BOOL ImportMeshPrimitivesAsNode(
 
             cgltf_float worldPosition[3];
 
-            TransformGltfPoint(
-                gltfWorld,
-                localPosition[0],
-                localPosition[1],
-                localPosition[2],
-                worldPosition);
+            if (preserveSourceHierarchy)
+            {
+                worldPosition[0] = localPosition[0];
+                worldPosition[1] = localPosition[1];
+                worldPosition[2] = localPosition[2];
+            }
+            else
+            {
+                TransformGltfPoint(
+                    gltfWorld,
+                    localPosition[0],
+                    localPosition[1],
+                    localPosition[2],
+                    worldPosition);
+            }
 
             const Point3 maxPosition =
-                ConvertGltfLocalPositionToMax(
+                preserveSourceHierarchy
+                ? ConvertGltfPositionToMax(
+                    worldPosition,
+                    NULL)
+                : ConvertGltfLocalPositionToMax(
                     worldPosition);
 
             const MaxGLBPositionKey key(
@@ -9127,6 +10618,48 @@ static BOOL ImportMeshPrimitivesAsNode(
                 totalSourceVertexCount));
 
         maxMesh.setNumTVFaces(
+            static_cast<int>(
+                totalFaceCount));
+    }
+
+    if (anyUv1)
+    {
+        maxMesh.setMapSupport(
+            2,
+            TRUE);
+
+        maxMesh.setNumMapVerts(
+            2,
+            static_cast<int>(
+                totalSourceVertexCount));
+
+        maxMesh.setNumMapFaces(
+            2,
+            static_cast<int>(
+                totalFaceCount));
+    }
+
+    for (size_t bakedChannelIndex = 0;
+         bakedChannelIndex <
+            bakedTextureChannels.size();
+         ++bakedChannelIndex)
+    {
+        const int mapChannel =
+            bakedTextureChannels[
+                bakedChannelIndex]
+                .maxMapChannel;
+
+        maxMesh.setMapSupport(
+            mapChannel,
+            TRUE);
+
+        maxMesh.setNumMapVerts(
+            mapChannel,
+            static_cast<int>(
+                totalSourceVertexCount));
+
+        maxMesh.setNumMapFaces(
+            mapChannel,
             static_cast<int>(
                 totalFaceCount));
     }
@@ -9233,6 +10766,118 @@ static BOOL ImportMeshPrimitivesAsNode(
                     importedUv;
             }
 
+            if (anyUv1)
+            {
+                UVVert importedUv1(
+                    0.0f,
+                    0.0f,
+                    0.0f);
+
+                if (info.hasUv1)
+                {
+                    cgltf_float texCoord1[2];
+
+                    if (!cgltf_accessor_read_float(
+                            info.texcoords1,
+                            sourceVertexIndex,
+                            texCoord1,
+                            2))
+                    {
+                        triObject->DeleteThis();
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("A TEXCOORD_1 value could not be read."));
+                        return FALSE;
+                    }
+
+                    importedUv1 =
+                        UVVert(
+                            static_cast<float>(
+                                texCoord1[0]),
+                            static_cast<float>(
+                                1.0f -
+                                texCoord1[1]),
+                            0.0f);
+                }
+
+                maxMesh.setMapVert(
+                    2,
+                    static_cast<int>(
+                        info.uv1Base +
+                        static_cast<size_t>(
+                            sourceVertexIndex)),
+                    importedUv1);
+            }
+
+            for (size_t bakedChannelIndex = 0;
+                 bakedChannelIndex <
+                    bakedTextureChannels.size();
+                 ++bakedChannelIndex)
+            {
+                const MaxGLBBakedTextureChannel&
+                    bakedChannel =
+                        bakedTextureChannels[
+                            bakedChannelIndex];
+
+                const cgltf_accessor* sourceUvAccessor =
+                    bakedChannel.sourceTexCoord == 0
+                    ? info.texcoords
+                    : info.texcoords1;
+
+                UVVert bakedUv(
+                    0.0f,
+                    0.0f,
+                    0.0f);
+
+                if (sourceUvAccessor != NULL)
+                {
+                    cgltf_float sourceUv[2];
+
+                    if (!cgltf_accessor_read_float(
+                            sourceUvAccessor,
+                            sourceVertexIndex,
+                            sourceUv,
+                            2))
+                    {
+                        triObject->DeleteThis();
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("A texture coordinate could not be read while baking KHR_texture_transform."));
+                        return FALSE;
+                    }
+
+                    float transformedU = 0.0f;
+                    float transformedV = 0.0f;
+
+                    ApplyGltfTextureTransformToUv(
+                        bakedChannel,
+                        static_cast<float>(
+                            sourceUv[0]),
+                        static_cast<float>(
+                            sourceUv[1]),
+                        &transformedU,
+                        &transformedV);
+
+                    bakedUv =
+                        UVVert(
+                            transformedU,
+                            1.0f - transformedV,
+                            0.0f);
+                }
+
+                maxMesh.setMapVert(
+                    bakedChannel.maxMapChannel,
+                    static_cast<int>(
+                        info.uvBase +
+                        static_cast<size_t>(
+                            sourceVertexIndex)),
+                    bakedUv);
+            }
+
             if (allHaveNormals)
             {
                 cgltf_float sourceNormal[3];
@@ -9257,7 +10902,11 @@ static BOOL ImportMeshPrimitivesAsNode(
                         info.normalBase +
                         static_cast<size_t>(
                             sourceVertexIndex))) =
-                    TransformGltfNormalToMaxWorld(
+                    preserveSourceHierarchy
+                    ? ConvertGltfNormalToMax(
+                        sourceNormal,
+                        NULL)
+                    : TransformGltfNormalToMaxWorld(
                         gltfWorld,
                         sourceNormal);
 
@@ -9388,6 +11037,81 @@ static BOOL ImportMeshPrimitivesAsNode(
                                 sourceIndices[2])));
             }
 
+            if (anyUv1)
+            {
+                TVFace* mapFaces2 =
+                    maxMesh.mapFaces(2);
+
+                if (mapFaces2 == NULL)
+                {
+                    triObject->DeleteThis();
+
+                    _tcscpy_s(
+                        errorMessage,
+                        errorMessageCount,
+                        _T("3ds Max could not access combined UV channel 2 faces."));
+                    return FALSE;
+                }
+
+                mapFaces2[
+                    destinationFaceIndex]
+                    .setTVerts(
+                        static_cast<int>(
+                            info.uv1Base +
+                            static_cast<size_t>(
+                                sourceIndices[0])),
+                        static_cast<int>(
+                            info.uv1Base +
+                            static_cast<size_t>(
+                                sourceIndices[1])),
+                        static_cast<int>(
+                            info.uv1Base +
+                            static_cast<size_t>(
+                                sourceIndices[2])));
+            }
+
+            for (size_t bakedChannelIndex = 0;
+                 bakedChannelIndex <
+                    bakedTextureChannels.size();
+                 ++bakedChannelIndex)
+            {
+                const int mapChannel =
+                    bakedTextureChannels[
+                        bakedChannelIndex]
+                        .maxMapChannel;
+
+                TVFace* bakedMapFaces =
+                    maxMesh.mapFaces(
+                        mapChannel);
+
+                if (bakedMapFaces == NULL)
+                {
+                    triObject->DeleteThis();
+
+                    _tcscpy_s(
+                        errorMessage,
+                        errorMessageCount,
+                        _T("3ds Max could not access a baked texture-transform map channel."));
+                    return FALSE;
+                }
+
+                bakedMapFaces[
+                    destinationFaceIndex]
+                    .setTVerts(
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[0])),
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[1])),
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[2])));
+            }
+
             if (allHaveNormals)
             {
                 MeshNormalFace& normalFace =
@@ -9434,6 +11158,9 @@ static BOOL ImportMeshPrimitivesAsNode(
     {
         maxMesh.buildNormals();
     }
+
+    g_activeImportTextureViewMapChannels =
+        textureViewMapChannels;
 
     std::vector<Mtl*> importedSubMaterials;
 
@@ -9640,7 +11367,10 @@ static BOOL ImportMeshPrimitivesAsNode(
 
     maxNode->SetNodeTM(
         maxInterface->GetTime(),
-        Matrix3(1));
+        preserveSourceHierarchy
+            ? BuildMaxNodeTransform(
+                sourceNode)
+            : Matrix3(1));
 
     maxNode->SetName(
         importedNodeName);
@@ -9665,7 +11395,8 @@ static BOOL ImportMeshPrimitivesAsNode(
         static_cast<int>(
             totalFaceCount);
 
-    if (anyUv)
+    if (anyUv ||
+        anyUv1)
     {
         ++importStats->objectsWithUv;
     }
@@ -9700,10 +11431,85 @@ static BOOL ImportMeshPrimitivesAsNode(
 }
 
 
+static INode* CreateImportedHierarchyDummy(
+    const cgltf_node* sourceNode,
+    Interface* maxInterface,
+    MaxGLBImportStats* importStats,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    Object* dummyObject =
+        static_cast<Object*>(
+            CreateInstance(
+                HELPER_CLASS_ID,
+                Class_ID(DUMMY_CLASS_ID, 0)));
+
+    if (dummyObject == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create an imported hierarchy Dummy."));
+        return NULL;
+    }
+
+    INode* dummyNode =
+        maxInterface->CreateObjectNode(
+            dummyObject);
+
+    if (dummyNode == NULL)
+    {
+        dummyObject->DeleteThis();
+
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create an imported hierarchy node."));
+        return NULL;
+    }
+
+    TCHAR nodeName[256];
+    nodeName[0] = _T('\0');
+
+    if (sourceNode != NULL)
+    {
+        ConvertUtf8ToTchar(
+            sourceNode->name,
+            nodeName,
+            _countof(nodeName));
+    }
+
+    if (nodeName[0] == _T('\0'))
+    {
+        _stprintf_s(
+            nodeName,
+            _countof(nodeName),
+            _T("GLB_Node_%d"),
+            importStats->nextObjectIndex++);
+    }
+
+    dummyNode->SetName(nodeName);
+
+    dummyNode->SetNodeTM(
+        maxInterface->GetTime(),
+        BuildMaxNodeTransform(
+            sourceNode));
+
+    dummyNode->SetWireColor(
+        RGB(255, 204, 64));
+
+    importStats->createdNodes.push_back(
+        dummyNode);
+
+    return dummyNode;
+}
+
+
 static BOOL ImportNodeMeshesRecursive(
     cgltf_data* data,
     const TCHAR* sourceFilename,
     const cgltf_node* sourceNode,
+    INode* parentMaxNode,
     Interface* maxInterface,
     MaxGLBImportStats* importStats,
     TCHAR* errorMessage,
@@ -9714,6 +11520,8 @@ static BOOL ImportNodeMeshesRecursive(
         return TRUE;
     }
 
+    INode* currentMaxNode = NULL;
+
     if (sourceNode->mesh != NULL)
     {
         cgltf_mesh* sourceMesh =
@@ -9723,13 +11531,11 @@ static BOOL ImportNodeMeshesRecursive(
         int singleValidPrimitiveIndex = -1;
 
         for (cgltf_size primitiveIndex = 0;
-             primitiveIndex <
-                sourceMesh->primitives_count;
+             primitiveIndex < sourceMesh->primitives_count;
              ++primitiveIndex)
         {
             cgltf_primitive* primitive =
-                &sourceMesh->primitives[
-                    primitiveIndex];
+                &sourceMesh->primitives[primitiveIndex];
 
             const cgltf_accessor* positions =
                 cgltf_find_accessor(
@@ -9745,25 +11551,16 @@ static BOOL ImportNodeMeshesRecursive(
                 positions->count > 0)
             {
                 ++validPrimitiveCount;
-
                 singleValidPrimitiveIndex =
-                    static_cast<int>(
-                        primitiveIndex);
+                    static_cast<int>(primitiveIndex);
             }
         }
 
+        const size_t previousCount =
+            importStats->createdNodes.size();
+
         if (validPrimitiveCount > 1)
         {
-            if (importStats->nextObjectIndex ==
-                INT_MAX)
-            {
-                _tcscpy_s(
-                    errorMessage,
-                    errorMessageCount,
-                    _T("The GLB contains too many mesh nodes."));
-                return FALSE;
-            }
-
             const int objectIndex =
                 importStats->nextObjectIndex++;
 
@@ -9783,17 +11580,6 @@ static BOOL ImportNodeMeshesRecursive(
         }
         else if (validPrimitiveCount == 1)
         {
-            if (singleValidPrimitiveIndex < 0 ||
-                importStats->nextObjectIndex ==
-                    INT_MAX)
-            {
-                _tcscpy_s(
-                    errorMessage,
-                    errorMessageCount,
-                    _T("The GLB contains an invalid mesh primitive."));
-                return FALSE;
-            }
-
             const int objectIndex =
                 importStats->nextObjectIndex++;
 
@@ -9814,18 +11600,62 @@ static BOOL ImportNodeMeshesRecursive(
                 return FALSE;
             }
         }
+
+        if (importStats->createdNodes.size() >
+            previousCount)
+        {
+            currentMaxNode =
+                importStats->createdNodes.back();
+        }
     }
 
+    if (g_activeImportSettings.preserveHierarchy &&
+        currentMaxNode == NULL)
+    {
+        currentMaxNode =
+            CreateImportedHierarchyDummy(
+                sourceNode,
+                maxInterface,
+                importStats,
+                errorMessage,
+                errorMessageCount);
+
+        if (currentMaxNode == NULL)
+        {
+            return FALSE;
+        }
+    }
+
+    if (g_activeImportSettings.preserveHierarchy &&
+        currentMaxNode != NULL)
+    {
+        if (parentMaxNode != NULL)
+        {
+            parentMaxNode->AttachChild(
+                currentMaxNode,
+                1);
+        }
+        else
+        {
+            importStats->hierarchyRootNodes.push_back(
+                currentMaxNode);
+        }
+    }
+
+    INode* childParent =
+        g_activeImportSettings.preserveHierarchy
+        ? currentMaxNode
+        : NULL;
+
     for (cgltf_size childIndex = 0;
-         childIndex <
-            sourceNode->children_count;
+         childIndex < sourceNode->children_count;
          ++childIndex)
     {
         if (!ImportNodeMeshesRecursive(
                 data,
                 sourceFilename,
-                sourceNode->children[
-                    childIndex],
+                sourceNode->children[childIndex],
+                childParent,
                 maxInterface,
                 importStats,
                 errorMessage,
@@ -9975,12 +11805,18 @@ static BOOL CreateImportedParentNode(
     rootNode->SetWireColor(
         RGB(255, 204, 64));
 
+    const std::vector<INode*>& nodesToAttach =
+        g_activeImportSettings.preserveHierarchy &&
+        !importStats->hierarchyRootNodes.empty()
+        ? importStats->hierarchyRootNodes
+        : importStats->createdNodes;
+
     for (size_t nodeIndex = 0;
-         nodeIndex < importStats->createdNodes.size();
+         nodeIndex < nodesToAttach.size();
          ++nodeIndex)
     {
         INode* childNode =
-            importStats->createdNodes[nodeIndex];
+            nodesToAttach[nodeIndex];
 
         if (childNode != NULL &&
             childNode != rootNode)
@@ -10042,6 +11878,7 @@ static BOOL ImportAllSceneMeshes(
                     data,
                     sourceFilename,
                     activeScene->nodes[rootIndex],
+                    NULL,
                     maxInterface,
                     importStats,
                     errorMessage,
@@ -10071,6 +11908,7 @@ static BOOL ImportAllSceneMeshes(
                     data,
                     sourceFilename,
                     node,
+                    NULL,
                     maxInterface,
                     importStats,
                     errorMessage,
@@ -10165,7 +12003,7 @@ public:
 
     unsigned int Version()
     {
-        return 109;
+        return 111;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -10650,6 +12488,74 @@ enum MaxGLBExportTextureRole
 };
 
 
+enum MaxGLBExportTextureUsage
+{
+    MAXGLB_USAGE_BASE_COLOR = 0,
+    MAXGLB_USAGE_NORMAL = 1,
+    MAXGLB_USAGE_METALLIC_ROUGHNESS = 2,
+    MAXGLB_USAGE_OCCLUSION = 3,
+    MAXGLB_USAGE_EMISSIVE = 4,
+    MAXGLB_TEXTURE_USAGE_COUNT = 5
+};
+
+
+static int MaxGLBTextureRoleForUsage(
+    int usage)
+{
+    if (usage == MAXGLB_USAGE_BASE_COLOR)
+    {
+        return MAXGLB_TEXTURE_BASE_COLOR;
+    }
+
+    if (usage == MAXGLB_USAGE_NORMAL)
+    {
+        return MAXGLB_TEXTURE_NORMAL;
+    }
+
+    if (usage == MAXGLB_USAGE_METALLIC_ROUGHNESS ||
+        usage == MAXGLB_USAGE_OCCLUSION)
+    {
+        return MAXGLB_TEXTURE_ORM;
+    }
+
+    return MAXGLB_TEXTURE_EMISSIVE;
+}
+
+
+struct MaxGLBExportTextureViewData
+{
+    BOOL present;
+    BOOL hasTransform;
+
+    float offset[2];
+    float scale[2];
+    float rotation;
+
+    int texCoord;
+    int wrapS;
+    int wrapT;
+    int minFilter;
+    int magFilter;
+
+    MaxGLBExportTextureViewData()
+        : present(FALSE)
+        , hasTransform(FALSE)
+        , rotation(0.0f)
+        , texCoord(0)
+        , wrapS(10497)
+        , wrapT(10497)
+        , minFilter(9987)
+        , magFilter(9729)
+    {
+        offset[0] = 0.0f;
+        offset[1] = 0.0f;
+
+        scale[0] = 1.0f;
+        scale[1] = 1.0f;
+    }
+};
+
+
 struct MaxGLBExportImageData
 {
     BOOL present;
@@ -10682,6 +12588,9 @@ struct MaxGLBExportMaterial
     MaxGLBExportImageData textures[
         MAXGLB_TEXTURE_COUNT];
 
+    MaxGLBExportTextureViewData textureViews[
+        MAXGLB_TEXTURE_USAGE_COUNT];
+
     MaxGLBExportMaterial()
         : present(FALSE)
         , doubleSided(FALSE)
@@ -10694,6 +12603,39 @@ struct MaxGLBExportMaterial
         baseColor[1] = 1.0f;
         baseColor[2] = 1.0f;
         baseColor[3] = 1.0f;
+    }
+};
+
+
+struct MaxGLBExportNode
+{
+    std::string name;
+
+    int parentIndex;
+    int meshGroupIndex;
+
+    BOOL hasTransform;
+    float matrix[16];
+
+    std::vector<int> children;
+
+    MaxGLBExportNode()
+        : parentIndex(-1)
+        , meshGroupIndex(-1)
+        , hasTransform(FALSE)
+    {
+        for (int matrixIndex = 0;
+             matrixIndex < 16;
+             ++matrixIndex)
+        {
+            matrix[matrixIndex] =
+                matrixIndex == 0 ||
+                matrixIndex == 5 ||
+                matrixIndex == 10 ||
+                matrixIndex == 15
+                ? 1.0f
+                : 0.0f;
+        }
     }
 };
 
@@ -10715,22 +12657,51 @@ struct MaxGLBExportMesh
     std::vector<float> positions;
     std::vector<float> normals;
     std::vector<float> texcoords;
+    std::vector<float> texcoords1;
     std::vector<unsigned int> indices;
 
     BOOL hasTexcoords;
+    BOOL hasTexcoords1;
+    BOOL hasNodeTransform;
+
+    // glTF column-major node matrix. It is emitted only in Preserve mode.
+    float nodeMatrix[16];
 
     MaxGLBExportMaterial material;
 
+    // Accessor bounds in mesh-local glTF space.
     float minimum[3];
     float maximum[3];
+
+    // World-space bounds used by Scale/Normalize in both transform modes.
+    float worldMinimum[3];
+    float worldMaximum[3];
 
     MaxGLBExportMesh()
         : nodeGroupIndex(-1)
         , sourceMaterialId(0)
         , hasTexcoords(FALSE)
+        , hasTexcoords1(FALSE)
+        , hasNodeTransform(FALSE)
     {
+        for (int matrixIndex = 0;
+             matrixIndex < 16;
+             ++matrixIndex)
+        {
+            nodeMatrix[matrixIndex] =
+                matrixIndex == 0 ||
+                matrixIndex == 5 ||
+                matrixIndex == 10 ||
+                matrixIndex == 15
+                ? 1.0f
+                : 0.0f;
+        }
+
         minimum[0] = minimum[1] = minimum[2] = 0.0f;
         maximum[0] = maximum[1] = maximum[2] = 0.0f;
+
+        worldMinimum[0] = worldMinimum[1] = worldMinimum[2] = 0.0f;
+        worldMaximum[0] = worldMaximum[1] = worldMaximum[2] = 0.0f;
     }
 };
 
@@ -10747,15 +12718,21 @@ struct MaxGLBExportVertexKey
 
     float uvX;
     float uvY;
+    float uv1X;
+    float uv1Y;
 
     BOOL hasTexcoord;
+    BOOL hasTexcoord1;
 
     MaxGLBExportVertexKey(
         const Point3& position,
         const Point3& normal,
         BOOL hasUv,
         float u,
-        float v)
+        float v,
+        BOOL hasUv1,
+        float u1,
+        float v1)
         : positionX(position.x)
         , positionY(position.y)
         , positionZ(position.z)
@@ -10764,7 +12741,10 @@ struct MaxGLBExportVertexKey
         , normalZ(normal.z)
         , uvX(u)
         , uvY(v)
+        , uv1X(u1)
+        , uv1Y(v1)
         , hasTexcoord(hasUv)
+        , hasTexcoord1(hasUv1)
     {
     }
 
@@ -10799,6 +12779,22 @@ struct MaxGLBExportVertexKey
             MAXGLB_COMPARE_FIELD(uvY);
         }
 
+        if (hasTexcoord1 < other.hasTexcoord1)
+        {
+            return true;
+        }
+
+        if (hasTexcoord1 > other.hasTexcoord1)
+        {
+            return false;
+        }
+
+        if (hasTexcoord1)
+        {
+            MAXGLB_COMPARE_FIELD(uv1X);
+            MAXGLB_COMPARE_FIELD(uv1Y);
+        }
+
 #undef MAXGLB_COMPARE_FIELD
 
         return false;
@@ -10814,17 +12810,21 @@ struct MaxGLBExportLayout
     size_t normalLength;
     size_t texcoordOffset;
     size_t texcoordLength;
+    size_t texcoord1Offset;
+    size_t texcoord1Length;
     size_t indexOffset;
     size_t indexLength;
 
     size_t positionBufferView;
     size_t normalBufferView;
     size_t texcoordBufferView;
+    size_t texcoord1BufferView;
     size_t indexBufferView;
 
     size_t positionAccessor;
     size_t normalAccessor;
     size_t texcoordAccessor;
+    size_t texcoord1Accessor;
     size_t indexAccessor;
 
     BOOL hasMaterial;
@@ -10834,8 +12834,11 @@ struct MaxGLBExportLayout
     size_t imageOffset[MAXGLB_TEXTURE_COUNT];
     size_t imageLength[MAXGLB_TEXTURE_COUNT];
     size_t imageBufferView[MAXGLB_TEXTURE_COUNT];
-    size_t textureIndex[MAXGLB_TEXTURE_COUNT];
     size_t imageIndex[MAXGLB_TEXTURE_COUNT];
+
+    BOOL hasTextureView[MAXGLB_TEXTURE_USAGE_COUNT];
+    size_t textureViewIndex[MAXGLB_TEXTURE_USAGE_COUNT];
+    size_t samplerIndex[MAXGLB_TEXTURE_USAGE_COUNT];
 
     MaxGLBExportLayout()
         : positionOffset(0)
@@ -10844,15 +12847,19 @@ struct MaxGLBExportLayout
         , normalLength(0)
         , texcoordOffset(0)
         , texcoordLength(0)
+        , texcoord1Offset(0)
+        , texcoord1Length(0)
         , indexOffset(0)
         , indexLength(0)
         , positionBufferView(0)
         , normalBufferView(0)
         , texcoordBufferView(0)
+        , texcoord1BufferView(0)
         , indexBufferView(0)
         , positionAccessor(0)
         , normalAccessor(0)
         , texcoordAccessor(0)
+        , texcoord1Accessor(0)
         , indexAccessor(0)
         , hasMaterial(FALSE)
         , materialIndex(0)
@@ -10865,8 +12872,16 @@ struct MaxGLBExportLayout
             imageOffset[roleIndex] = 0;
             imageLength[roleIndex] = 0;
             imageBufferView[roleIndex] = 0;
-            textureIndex[roleIndex] = 0;
             imageIndex[roleIndex] = 0;
+        }
+
+        for (int usageIndex = 0;
+             usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+             ++usageIndex)
+        {
+            hasTextureView[usageIndex] = FALSE;
+            textureViewIndex[usageIndex] = 0;
+            samplerIndex[usageIndex] = 0;
         }
     }
 };
@@ -11024,6 +13039,91 @@ static Point3 ConvertMaxWorldNormalToGltf(
     }
 
     return gltfNormal;
+}
+
+
+static void BuildGltfNodeMatrix(
+    const Matrix3& maxNodeTransform,
+    float* outputMatrix)
+{
+    if (outputMatrix == NULL)
+    {
+        return;
+    }
+
+    // Max uses row-vector matrices in Z-up space. glTF uses column-vector
+    // matrices in Y-up space. Mesh-local coordinates are converted with:
+    //     (x, y, z)_Max -> (x, z, -y)_glTF
+    //
+    // A glTF local X axis corresponds to Max local X.
+    // A glTF local Y axis corresponds to Max local Z.
+    // A glTF local Z axis corresponds to negative Max local Y.
+    const Point3 gltfColumnX =
+        ConvertMaxWorldPositionToGltf(
+            maxNodeTransform.GetRow(0));
+
+    const Point3 gltfColumnY =
+        ConvertMaxWorldPositionToGltf(
+            maxNodeTransform.GetRow(2));
+
+    const Point3 gltfColumnZ =
+        ConvertMaxWorldPositionToGltf(
+            -maxNodeTransform.GetRow(1));
+
+    const Point3 gltfTranslation =
+        ConvertMaxWorldPositionToGltf(
+            maxNodeTransform.GetRow(3));
+
+    // glTF serializes matrices in column-major order.
+    outputMatrix[0] = gltfColumnX.x;
+    outputMatrix[1] = gltfColumnX.y;
+    outputMatrix[2] = gltfColumnX.z;
+    outputMatrix[3] = 0.0f;
+
+    outputMatrix[4] = gltfColumnY.x;
+    outputMatrix[5] = gltfColumnY.y;
+    outputMatrix[6] = gltfColumnY.z;
+    outputMatrix[7] = 0.0f;
+
+    outputMatrix[8] = gltfColumnZ.x;
+    outputMatrix[9] = gltfColumnZ.y;
+    outputMatrix[10] = gltfColumnZ.z;
+    outputMatrix[11] = 0.0f;
+
+    outputMatrix[12] = gltfTranslation.x;
+    outputMatrix[13] = gltfTranslation.y;
+    outputMatrix[14] = gltfTranslation.z;
+    outputMatrix[15] = 1.0f;
+}
+
+
+static void ApplyUniformWorldScaleToGltfNodeMatrix(
+    float* matrix,
+    float uniformScale)
+{
+    if (matrix == NULL)
+    {
+        return;
+    }
+
+    // Left-multiplying by a global uniform scale scales the three world
+    // rows of the column-major matrix, including translation.
+    const int scaledIndices[12] =
+    {
+        0, 1, 2,
+        4, 5, 6,
+        8, 9, 10,
+        12, 13, 14
+    };
+
+    for (int index = 0;
+         index < 12;
+         ++index)
+    {
+        matrix[
+            scaledIndices[index]] *=
+                uniformScale;
+    }
 }
 
 
@@ -11878,6 +13978,271 @@ static BitmapTex* GetDirectBitmapFromStandardSlot(
     }
 
     return static_cast<BitmapTex*>(map);
+}
+
+
+static BOOL IsDefaultTextureTransform(
+    const MaxGLBExportTextureViewData& view)
+{
+    return MaxGLBNearlyEqual(
+            view.offset[0],
+            0.0f) &&
+        MaxGLBNearlyEqual(
+            view.offset[1],
+            0.0f) &&
+        MaxGLBNearlyEqual(
+            view.scale[0],
+            1.0f) &&
+        MaxGLBNearlyEqual(
+            view.scale[1],
+            1.0f) &&
+        MaxGLBNearlyEqual(
+            view.rotation,
+            0.0f);
+}
+
+
+static BOOL CaptureBitmapTextureView(
+    BitmapTex* bitmap,
+    TimeValue timeValue,
+    MaxGLBExportTextureViewData* output,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (output == NULL)
+    {
+        return TRUE;
+    }
+
+    *output =
+        MaxGLBExportTextureViewData();
+
+    if (bitmap == NULL)
+    {
+        return TRUE;
+    }
+
+    StdUVGen* uvGenerator =
+        bitmap->GetUVGen();
+
+    if (uvGenerator == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("A Bitmap texture has no Standard UV generator."));
+        return FALSE;
+    }
+
+    const float maxUOffset =
+        uvGenerator->GetUOffs(
+            timeValue);
+
+    const float maxVOffset =
+        uvGenerator->GetVOffs(
+            timeValue);
+
+    const float maxUScale =
+        uvGenerator->GetUScl(
+            timeValue);
+
+    const float maxVScale =
+        uvGenerator->GetVScl(
+            timeValue);
+
+    const float maxWAngle =
+        uvGenerator->GetWAng(
+            timeValue);
+
+    const int maxMapChannel =
+        uvGenerator->GetMapChannel();
+
+    const int maxTextureTiling =
+        uvGenerator->GetTextureTiling();
+
+    MaxGLBTextureMetadata importedMetadata;
+
+    const BOOL hasImportedMetadata =
+        ReadMaxGLBTextureMetadata(
+            bitmap,
+            &importedMetadata);
+
+    const BOOL importedValuesUnchanged =
+        hasImportedMetadata &&
+        MaxGLBNearlyEqual(
+            maxUOffset,
+            importedMetadata.maxUOffset) &&
+        MaxGLBNearlyEqual(
+            maxVOffset,
+            importedMetadata.maxVOffset) &&
+        MaxGLBNearlyEqual(
+            maxUScale,
+            importedMetadata.maxUScale) &&
+        MaxGLBNearlyEqual(
+            maxVScale,
+            importedMetadata.maxVScale) &&
+        MaxGLBNearlyEqual(
+            maxWAngle,
+            importedMetadata.maxWAngle) &&
+        maxMapChannel ==
+            importedMetadata.maxMapChannel &&
+        maxTextureTiling ==
+            importedMetadata.maxTextureTiling;
+
+    if (importedValuesUnchanged)
+    {
+        output->offset[0] =
+            importedMetadata.offset[0];
+
+        output->offset[1] =
+            importedMetadata.offset[1];
+
+        output->scale[0] =
+            importedMetadata.scale[0];
+
+        output->scale[1] =
+            importedMetadata.scale[1];
+
+        output->rotation =
+            importedMetadata.rotation;
+
+        output->texCoord =
+            importedMetadata.texCoord;
+
+        output->wrapS =
+            importedMetadata.wrapS;
+
+        output->wrapT =
+            importedMetadata.wrapT;
+
+        output->minFilter =
+            importedMetadata.minFilter;
+
+        output->magFilter =
+            importedMetadata.magFilter;
+    }
+    else
+    {
+        if (maxMapChannel < 1 ||
+            maxMapChannel > 2)
+        {
+            if (hasImportedMetadata &&
+                maxMapChannel ==
+                    importedMetadata.maxMapChannel)
+            {
+                _stprintf_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("Bitmap '%s' uses baked KHR_texture_transform channel %d, but its Bitmap Coordinates were edited. Reset the imported coordinate values or switch the Bitmap to Max map channel 1 or 2 before export."),
+                    bitmap->GetName(),
+                    maxMapChannel);
+            }
+            else
+            {
+                _stprintf_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("Bitmap '%s' uses Max map channel %d. MaxGLB2016 currently exports artist-authored map channels 1 and 2 as TEXCOORD_0 and TEXCOORD_1."),
+                    bitmap->GetName(),
+                    maxMapChannel);
+            }
+
+            return FALSE;
+        }
+
+        output->scale[0] =
+            maxUScale;
+
+        output->scale[1] =
+            maxVScale;
+
+        output->rotation =
+            -maxWAngle;
+
+        // Inverse of ApplyGltfTextureViewToBitmap().
+        output->offset[0] =
+            maxUOffset -
+            maxVScale *
+                sinf(maxWAngle);
+
+        output->offset[1] =
+            1.0f -
+            maxVOffset -
+            maxVScale *
+                cosf(maxWAngle);
+
+        output->texCoord =
+            maxMapChannel - 1;
+
+        output->wrapS =
+            MaxTilingFlagsToGltfWrapS(
+                maxTextureTiling);
+
+        output->wrapT =
+            MaxTilingFlagsToGltfWrapT(
+                maxTextureTiling);
+
+        // Max 2016 exposes one bitmap filter choice rather than separate
+        // glTF min/mag filters. Preserve imported filters when available;
+        // otherwise use high-quality linear defaults.
+        output->minFilter =
+            hasImportedMetadata
+            ? importedMetadata.minFilter
+            : GetDefaultGltfMinFilter();
+
+        output->magFilter =
+            hasImportedMetadata
+            ? importedMetadata.magFilter
+            : GetDefaultGltfMagFilter();
+    }
+
+    output->hasTransform =
+        !IsDefaultTextureTransform(
+            *output);
+
+    output->present =
+        TRUE;
+
+    return TRUE;
+}
+
+
+static void WriteGltfTextureInfo(
+    std::ostringstream& json,
+    size_t textureIndex,
+    const MaxGLBExportTextureViewData& view)
+{
+    json
+        << "{"
+        << "\"index\":"
+        << textureIndex;
+
+    if (view.texCoord != 0)
+    {
+        json
+            << ",\"texCoord\":"
+            << view.texCoord;
+    }
+
+    if (view.hasTransform)
+    {
+        json
+            << ",\"extensions\":{"
+            << "\"KHR_texture_transform\":{"
+            << "\"offset\":["
+            << view.offset[0] << ","
+            << view.offset[1] << "],"
+            << "\"rotation\":"
+            << view.rotation
+            << ",\"scale\":["
+            << view.scale[0] << ","
+            << view.scale[1]
+            << "]"
+            << "}"
+            << "}";
+    }
+
+    json << "}";
 }
 
 
@@ -12782,6 +15147,101 @@ static BOOL CaptureMaterialMaps(
         }
     }
 
+    BitmapTex* baseMappingBitmap =
+        diffuseBitmap != NULL
+        ? diffuseBitmap
+        : opacityBitmap;
+
+    if (outputMaterial->textures[
+            MAXGLB_TEXTURE_BASE_COLOR]
+            .present &&
+        baseMappingBitmap != NULL)
+    {
+        if (!CaptureBitmapTextureView(
+                baseMappingBitmap,
+                timeValue,
+                &outputMaterial->textureViews[
+                    MAXGLB_USAGE_BASE_COLOR],
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
+    if (outputMaterial->textures[
+            MAXGLB_TEXTURE_NORMAL]
+            .present &&
+        normalBitmap != NULL)
+    {
+        if (!CaptureBitmapTextureView(
+                normalBitmap,
+                timeValue,
+                &outputMaterial->textureViews[
+                    MAXGLB_USAGE_NORMAL],
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
+    BitmapTex* metallicRoughnessMappingBitmap =
+        glossinessBitmap != NULL
+        ? glossinessBitmap
+        : metallicBitmap;
+
+    if (outputMaterial->textures[
+            MAXGLB_TEXTURE_ORM]
+            .present &&
+        metallicRoughnessMappingBitmap != NULL)
+    {
+        if (!CaptureBitmapTextureView(
+                metallicRoughnessMappingBitmap,
+                timeValue,
+                &outputMaterial->textureViews[
+                    MAXGLB_USAGE_METALLIC_ROUGHNESS],
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
+    if (outputMaterial->textures[
+            MAXGLB_TEXTURE_ORM]
+            .present &&
+        occlusionBitmap != NULL)
+    {
+        if (!CaptureBitmapTextureView(
+                occlusionBitmap,
+                timeValue,
+                &outputMaterial->textureViews[
+                    MAXGLB_USAGE_OCCLUSION],
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
+    if (outputMaterial->textures[
+            MAXGLB_TEXTURE_EMISSIVE]
+            .present &&
+        emissiveBitmap != NULL)
+    {
+        if (!CaptureBitmapTextureView(
+                emissiveBitmap,
+                timeValue,
+                &outputMaterial->textureViews[
+                    MAXGLB_USAGE_EMISSIVE],
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+    }
+
     return TRUE;
 }
 
@@ -12825,6 +15285,7 @@ static BOOL TryBuildExportMeshes(
     TimeValue timeValue,
     const MaxGLBExportSettings& settings,
     int nodeGroupIndex,
+    const Matrix3* nodeTransformOverride,
     std::vector<MaxGLBExportMesh>& outputMeshes,
     BOOL* outWasGeometry,
     TCHAR* errorMessage,
@@ -12959,6 +15420,76 @@ static BOOL TryBuildExportMeshes(
     const Matrix3 objectTransform =
         node->GetObjectTM(timeValue);
 
+    Matrix3 geometryTransform =
+        objectTransform;
+
+    Matrix3 emittedNodeTransform(1);
+
+    BOOL preserveNodeTransform =
+        settings.transformMode ==
+            MAXGLB_TRANSFORM_PRESERVE;
+
+    float gltfNodeMatrix[16] =
+    {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    if (preserveNodeTransform)
+    {
+        // Geometry must always be expressed relative to the node's WORLD
+        // pivot. In hierarchy mode nodeTransformOverride is only the LOCAL
+        // transform that will be serialized below the parent.
+        const Matrix3 pivotWorldTransform =
+            node->GetNodeTM(timeValue);
+
+        emittedNodeTransform =
+            nodeTransformOverride != NULL
+            ? *nodeTransformOverride
+            : pivotWorldTransform;
+
+        const float pivotDeterminant =
+            GetMatrixDeterminant3x3(
+                pivotWorldTransform);
+
+        if (!_finite(pivotDeterminant) ||
+            fabsf(pivotDeterminant) <=
+                1.0e-20f)
+        {
+            if (deleteConvertedObject)
+            {
+                triangleObject->DeleteThis();
+            }
+
+            _stprintf_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The pivot transform of '%s' is singular and cannot be preserved.\n")
+                _T("Use 'Bake transforms into geometry' for this object."),
+                node->GetName());
+
+            return FALSE;
+        }
+
+        // local-at-pivot * pivotWorldTM ==
+        // local-object * ObjectTM
+        //
+        // Do not use the hierarchy-local emittedNodeTransform here. Doing
+        // so would bake parent transforms into the mesh and then apply them
+        // again through the glTF hierarchy.
+        geometryTransform =
+            objectTransform *
+            Inverse(pivotWorldTransform);
+
+        BuildGltfNodeMatrix(
+            emittedNodeTransform,
+            gltfNodeMatrix);
+    }
+
+    // A mirrored total ObjectTM reverses world winding regardless of
+    // whether the transform is baked or stored on the glTF node.
     const BOOL reverseWinding =
         GetMatrixDeterminant3x3(
             objectTransform) < 0.0f;
@@ -12970,6 +15501,17 @@ static BOOL TryBuildExportMeshes(
 
     const int textureVertexCount =
         mesh.getNumTVerts();
+
+    const BOOL hasTexcoords1 =
+        mesh.mapSupport(2) &&
+        mesh.getNumMapVerts(2) > 0 &&
+        mesh.mapVerts(2) != NULL &&
+        mesh.mapFaces(2) != NULL;
+
+    const int textureVertexCount1 =
+        hasTexcoords1
+        ? mesh.getNumMapVerts(2)
+        : 0;
 
     mesh.SpecifyNormals();
 
@@ -13033,6 +15575,23 @@ static BOOL TryBuildExportMeshes(
         outputMesh.hasTexcoords =
             hasTexcoords;
 
+        outputMesh.hasTexcoords1 =
+            hasTexcoords1;
+
+        outputMesh.hasNodeTransform =
+            preserveNodeTransform;
+
+        if (preserveNodeTransform)
+        {
+            for (int matrixIndex = 0;
+                 matrixIndex < 16;
+                 ++matrixIndex)
+            {
+                outputMesh.nodeMatrix[matrixIndex] =
+                    gltfNodeMatrix[matrixIndex];
+            }
+        }
+
         Mtl* faceMaterial =
             ResolveFaceMaterial(
                 rootMaterial,
@@ -13054,6 +15613,60 @@ static BOOL TryBuildExportMeshes(
             }
 
             return FALSE;
+        }
+
+        for (int usageIndex = 0;
+             usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+             ++usageIndex)
+        {
+            const MaxGLBExportTextureViewData& textureView =
+                outputMesh.material.textureViews[
+                    usageIndex];
+
+            if (!textureView.present)
+            {
+                continue;
+            }
+
+            if (textureView.texCoord == 0 &&
+                !outputMesh.hasTexcoords)
+            {
+                if (deleteConvertedObject)
+                {
+                    triangleObject->DeleteThis();
+                }
+
+                _stprintf_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("Material '%s' uses TEXCOORD_0, but object '%s' has no Max map channel 1."),
+                    faceMaterial != NULL
+                        ? faceMaterial->GetName()
+                        : _T("(unnamed)"),
+                    node->GetName());
+
+                return FALSE;
+            }
+
+            if (textureView.texCoord == 1 &&
+                !outputMesh.hasTexcoords1)
+            {
+                if (deleteConvertedObject)
+                {
+                    triangleObject->DeleteThis();
+                }
+
+                _stprintf_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("Material '%s' uses TEXCOORD_1, but object '%s' has no Max map channel 2."),
+                    faceMaterial != NULL
+                        ? faceMaterial->GetName()
+                        : _T("(unnamed)"),
+                    node->GetName());
+
+                return FALSE;
+            }
         }
 
         size_t matchingFaceCount = 0;
@@ -13088,6 +15701,12 @@ static BOOL TryBuildExportMeshes(
         if (outputMesh.hasTexcoords)
         {
             outputMesh.texcoords.reserve(
+                maximumOutputVertexCount * 2);
+        }
+
+        if (outputMesh.hasTexcoords1)
+        {
+            outputMesh.texcoords1.reserve(
                 maximumOutputVertexCount * 2);
         }
 
@@ -13142,6 +15761,7 @@ static BOOL TryBuildExportMeshes(
             }
 
             Point3 fallbackPositions[3];
+            Point3 fallbackWorldPositions[3];
 
             for (int sourceCorner = 0;
                  sourceCorner < 3;
@@ -13166,10 +15786,18 @@ static BOOL TryBuildExportMeshes(
                     return FALSE;
                 }
 
+                const Point3 sourcePosition =
+                    mesh.getVert(
+                        sourceVertexIndex);
+
                 fallbackPositions[sourceCorner] =
                     ConvertMaxWorldPositionToGltf(
-                        mesh.getVert(
-                            sourceVertexIndex) *
+                        sourcePosition *
+                        geometryTransform);
+
+                fallbackWorldPositions[sourceCorner] =
+                    ConvertMaxWorldPositionToGltf(
+                        sourcePosition *
                         objectTransform);
             }
 
@@ -13220,6 +15848,10 @@ static BOOL TryBuildExportMeshes(
                     fallbackPositions[
                         sourceCorner];
 
+                const Point3 gltfWorldPosition =
+                    fallbackWorldPositions[
+                        sourceCorner];
+
                 Point3 gltfNormal =
                     fallbackFaceNormal;
 
@@ -13235,7 +15867,7 @@ static BOOL TryBuildExportMeshes(
                     const Point3 worldNormal =
                         TransformNormalToWorld(
                             localNormal,
-                            objectTransform);
+                            geometryTransform);
 
                     gltfNormal =
                         ConvertMaxWorldNormalToGltf(
@@ -13278,12 +15910,58 @@ static BOOL TryBuildExportMeshes(
                         1.0f - maxUv.y;
                 }
 
+                float gltfU1 = 0.0f;
+                float gltfV1 = 0.0f;
+
+                if (outputMesh.hasTexcoords1)
+                {
+                    TVFace* mapFaces1 =
+                        mesh.mapFaces(2);
+
+                    UVVert* mapVerts1 =
+                        mesh.mapVerts(2);
+
+                    const int textureVertexIndex1 =
+                        mapFaces1[faceIndex]
+                            .t[sourceCorner];
+
+                    if (textureVertexIndex1 < 0 ||
+                        textureVertexIndex1 >=
+                            textureVertexCount1)
+                    {
+                        if (deleteConvertedObject)
+                        {
+                            triangleObject->DeleteThis();
+                        }
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("A mesh contains an invalid channel-2 UV index."));
+                        return FALSE;
+                    }
+
+                    const UVVert& maxUv1 =
+                        mapVerts1[
+                            textureVertexIndex1];
+
+                    gltfU1 =
+                        maxUv1.x;
+
+                    gltfV1 =
+                        1.0f -
+                        maxUv1.y;
+                }
+
                 const MaxGLBExportVertexKey vertexKey(
                     gltfPosition,
                     gltfNormal,
                     outputMesh.hasTexcoords,
                     gltfU,
-                    gltfV);
+                    gltfV,
+                    outputMesh.hasTexcoords1,
+                    gltfU1,
+                    gltfV1);
 
                 std::map<
                     MaxGLBExportVertexKey,
@@ -13332,6 +16010,15 @@ static BOOL TryBuildExportMeshes(
                             gltfV);
                     }
 
+                    if (outputMesh.hasTexcoords1)
+                    {
+                        outputMesh.texcoords1.push_back(
+                            gltfU1);
+
+                        outputMesh.texcoords1.push_back(
+                            gltfV1);
+                    }
+
                     exportedVertexLookup.insert(
                         std::make_pair(
                             vertexKey,
@@ -13351,6 +16038,18 @@ static BOOL TryBuildExportMeshes(
                             outputMesh.maximum[2] =
                                 gltfPosition.z;
 
+                        outputMesh.worldMinimum[0] =
+                            outputMesh.worldMaximum[0] =
+                                gltfWorldPosition.x;
+
+                        outputMesh.worldMinimum[1] =
+                            outputMesh.worldMaximum[1] =
+                                gltfWorldPosition.y;
+
+                        outputMesh.worldMinimum[2] =
+                            outputMesh.worldMaximum[2] =
+                                gltfWorldPosition.z;
+
                         boundsInitialized =
                             TRUE;
                     }
@@ -13361,6 +16060,13 @@ static BOOL TryBuildExportMeshes(
                             gltfPosition.x,
                             gltfPosition.y,
                             gltfPosition.z
+                        };
+
+                        const float worldPositionValues[3] =
+                        {
+                            gltfWorldPosition.x,
+                            gltfWorldPosition.y,
+                            gltfWorldPosition.z
                         };
 
                         for (int axisIndex = 0;
@@ -13379,6 +16085,20 @@ static BOOL TryBuildExportMeshes(
                             {
                                 outputMesh.maximum[axisIndex] =
                                     positionValues[axisIndex];
+                            }
+
+                            if (worldPositionValues[axisIndex] <
+                                outputMesh.worldMinimum[axisIndex])
+                            {
+                                outputMesh.worldMinimum[axisIndex] =
+                                    worldPositionValues[axisIndex];
+                            }
+
+                            if (worldPositionValues[axisIndex] >
+                                outputMesh.worldMaximum[axisIndex])
+                            {
+                                outputMesh.worldMaximum[axisIndex] =
+                                    worldPositionValues[axisIndex];
                             }
                         }
                     }
@@ -13407,6 +16127,217 @@ static BOOL TryBuildExportMeshes(
     {
         *outWasGeometry =
             primitiveNumber > 0;
+    }
+
+    return TRUE;
+}
+
+
+static BOOL MaxGLBNodeHasExportableGeometry(
+    INode* node,
+    TimeValue timeValue)
+{
+    if (node == NULL)
+    {
+        return FALSE;
+    }
+
+    const ObjectState& objectState =
+        node->EvalWorldState(
+            timeValue);
+
+    Object* object =
+        objectState.obj;
+
+    return object != NULL &&
+        object->CanConvertToType(
+            triObjectClassID);
+}
+
+
+static BOOL MaxGLBSubtreeContainsExportableGeometry(
+    INode* node,
+    TimeValue timeValue)
+{
+    if (node == NULL)
+    {
+        return FALSE;
+    }
+
+    if (MaxGLBNodeHasExportableGeometry(
+            node,
+            timeValue))
+    {
+        return TRUE;
+    }
+
+    const int childCount =
+        node->NumberOfChildren();
+
+    for (int childIndex = 0;
+         childIndex < childCount;
+         ++childIndex)
+    {
+        if (MaxGLBSubtreeContainsExportableGeometry(
+                node->GetChildNode(
+                    childIndex),
+                timeValue))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static BOOL CollectHierarchyNodeRecursive(
+    INode* node,
+    TimeValue timeValue,
+    const MaxGLBExportSettings& settings,
+    int parentExportNodeIndex,
+    const Matrix3& parentWorldTransform,
+    std::vector<MaxGLBExportMesh>& outputMeshes,
+    std::vector<MaxGLBExportNode>& outputNodes,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (node == NULL ||
+        !MaxGLBSubtreeContainsExportableGeometry(
+            node,
+            timeValue))
+    {
+        return TRUE;
+    }
+
+    MaxGLBExportNode exportNode;
+
+    exportNode.name =
+        ConvertTcharToUtf8(
+            node->GetName());
+
+    if (exportNode.name.empty())
+    {
+        exportNode.name =
+            "MaxGLB_Node";
+    }
+
+    exportNode.parentIndex =
+        parentExportNodeIndex;
+
+    const Matrix3 nodeWorldTransform =
+        node->GetNodeTM(
+            timeValue);
+
+    Matrix3 nodeLocalTransform =
+        nodeWorldTransform;
+
+    if (parentExportNodeIndex >= 0)
+    {
+        const float parentDeterminant =
+            GetMatrixDeterminant3x3(
+                parentWorldTransform);
+
+        if (!_finite(parentDeterminant) ||
+            fabsf(parentDeterminant) <=
+                1.0e-20f)
+        {
+            _stprintf_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The parent transform above '%s' is singular and cannot be preserved."),
+                node->GetName());
+
+            return FALSE;
+        }
+
+        nodeLocalTransform =
+            nodeWorldTransform *
+            Inverse(
+                parentWorldTransform);
+    }
+
+    exportNode.hasTransform =
+        TRUE;
+
+    BuildGltfNodeMatrix(
+        nodeLocalTransform,
+        exportNode.matrix);
+
+    const int exportNodeIndex =
+        static_cast<int>(
+            outputNodes.size());
+
+    outputNodes.push_back(
+        exportNode);
+
+    if (parentExportNodeIndex >= 0)
+    {
+        outputNodes[
+            static_cast<size_t>(
+                parentExportNodeIndex)]
+            .children.push_back(
+                exportNodeIndex);
+    }
+
+    BOOL wasGeometry = FALSE;
+
+    if (MaxGLBNodeHasExportableGeometry(
+            node,
+            timeValue))
+    {
+        const int meshGroupIndex =
+            g_exportNextNodeGroupIndex;
+
+        if (!TryBuildExportMeshes(
+                node,
+                timeValue,
+                settings,
+                meshGroupIndex,
+                &nodeLocalTransform,
+                outputMeshes,
+                &wasGeometry,
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+
+        if (wasGeometry)
+        {
+            outputNodes[
+                static_cast<size_t>(
+                    exportNodeIndex)]
+                .meshGroupIndex =
+                    meshGroupIndex;
+
+            ++g_exportNextNodeGroupIndex;
+        }
+    }
+
+    ++g_exportProgressProcessedNodes;
+
+    const int childCount =
+        node->NumberOfChildren();
+
+    for (int childIndex = 0;
+         childIndex < childCount;
+         ++childIndex)
+    {
+        if (!CollectHierarchyNodeRecursive(
+                node->GetChildNode(
+                    childIndex),
+                timeValue,
+                settings,
+                exportNodeIndex,
+                nodeWorldTransform,
+                outputMeshes,
+                outputNodes,
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -13449,6 +16380,7 @@ static BOOL CollectSceneMeshesRecursive(
                 timeValue,
                 settings,
                 g_exportNextNodeGroupIndex,
+                NULL,
                 outputMeshes,
                 &wasGeometry,
                 errorMessage,
@@ -13485,6 +16417,7 @@ static BOOL CollectMeshesForExport(
     BOOL selectedOnly,
     const MaxGLBExportSettings& settings,
     std::vector<MaxGLBExportMesh>& outputMeshes,
+    std::vector<MaxGLBExportNode>& outputNodes,
     TCHAR* errorMessage,
     size_t errorMessageCount)
 {
@@ -13500,7 +16433,121 @@ static BOOL CollectMeshesForExport(
     const TimeValue timeValue =
         maxInterface->GetTime();
 
-    if (selectedOnly)
+    if (settings.preserveHierarchy)
+    {
+        if (selectedOnly)
+        {
+            const int selectedNodeCount =
+                maxInterface->GetSelNodeCount();
+
+            if (selectedNodeCount <= 0)
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("Export Selected was requested, but no objects are selected."));
+                return FALSE;
+            }
+
+            std::set<INode*> selectedNodes;
+
+            for (int selectedIndex = 0;
+                 selectedIndex < selectedNodeCount;
+                 ++selectedIndex)
+            {
+                selectedNodes.insert(
+                    maxInterface->GetSelNode(
+                        selectedIndex));
+            }
+
+            for (int selectedIndex = 0;
+                 selectedIndex < selectedNodeCount;
+                 ++selectedIndex)
+            {
+                INode* selectedNode =
+                    maxInterface->GetSelNode(
+                        selectedIndex);
+
+                if (selectedNode == NULL)
+                {
+                    continue;
+                }
+
+                BOOL hasSelectedAncestor =
+                    FALSE;
+
+                INode* ancestor =
+                    selectedNode->GetParentNode();
+
+                while (ancestor != NULL &&
+                       ancestor !=
+                           maxInterface->GetRootNode())
+                {
+                    if (selectedNodes.find(
+                            ancestor) !=
+                        selectedNodes.end())
+                    {
+                        hasSelectedAncestor =
+                            TRUE;
+                        break;
+                    }
+
+                    ancestor =
+                        ancestor->GetParentNode();
+                }
+
+                if (hasSelectedAncestor)
+                {
+                    continue;
+                }
+
+                if (!CollectHierarchyNodeRecursive(
+                        selectedNode,
+                        timeValue,
+                        settings,
+                        -1,
+                        Matrix3(1),
+                        outputMeshes,
+                        outputNodes,
+                        errorMessage,
+                        errorMessageCount))
+                {
+                    return FALSE;
+                }
+            }
+        }
+        else
+        {
+            INode* rootNode =
+                maxInterface->GetRootNode();
+
+            const int childCount =
+                rootNode != NULL
+                ? rootNode->NumberOfChildren()
+                : 0;
+
+            for (int childIndex = 0;
+                 childIndex < childCount;
+                 ++childIndex)
+            {
+                if (!CollectHierarchyNodeRecursive(
+                        rootNode->GetChildNode(
+                            childIndex),
+                        timeValue,
+                        settings,
+                        -1,
+                        Matrix3(1),
+                        outputMeshes,
+                        outputNodes,
+                        errorMessage,
+                        errorMessageCount))
+                {
+                    return FALSE;
+                }
+            }
+        }
+    }
+    else if (selectedOnly)
     {
         const int selectedNodeCount =
             maxInterface->GetSelNodeCount();
@@ -13529,6 +16576,7 @@ static BOOL CollectMeshesForExport(
                     timeValue,
                     settings,
                     g_exportNextNodeGroupIndex,
+                    NULL,
                     outputMeshes,
                     &wasGeometry,
                     errorMessage,
@@ -13565,7 +16613,9 @@ static BOOL CollectMeshesForExport(
             errorMessage,
             errorMessageCount,
             selectedOnly
-                ? _T("The current selection contains no exportable geometry.")
+                ? _T("The current selection contains no exportable geometry.\n\n")
+                  _T("When selecting an empty Root/Dummy, choose 'Preserve transforms and pivots' ")
+                  _T("and enable 'Preserve parent-child hierarchy' to export its mesh descendants.")
                 : _T("The scene contains no exportable geometry."));
         return FALSE;
     }
@@ -13574,9 +16624,9 @@ static BOOL CollectMeshesForExport(
 }
 
 
-
 static BOOL ApplyExportSizeSettings(
     std::vector<MaxGLBExportMesh>& meshes,
+    std::vector<MaxGLBExportNode>& nodes,
     MaxGLBExportSettings* settings,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -13633,10 +16683,10 @@ static BOOL ApplyExportSizeSettings(
                      ++axisIndex)
                 {
                     globalMinimum[axisIndex] =
-                        mesh.minimum[axisIndex];
+                        mesh.worldMinimum[axisIndex];
 
                     globalMaximum[axisIndex] =
-                        mesh.maximum[axisIndex];
+                        mesh.worldMaximum[axisIndex];
                 }
 
                 boundsInitialized = TRUE;
@@ -13647,18 +16697,18 @@ static BOOL ApplyExportSizeSettings(
                      axisIndex < 3;
                      ++axisIndex)
                 {
-                    if (mesh.minimum[axisIndex] <
+                    if (mesh.worldMinimum[axisIndex] <
                         globalMinimum[axisIndex])
                     {
                         globalMinimum[axisIndex] =
-                            mesh.minimum[axisIndex];
+                            mesh.worldMinimum[axisIndex];
                     }
 
-                    if (mesh.maximum[axisIndex] >
+                    if (mesh.worldMaximum[axisIndex] >
                         globalMaximum[axisIndex])
                     {
                         globalMaximum[axisIndex] =
-                            mesh.maximum[axisIndex];
+                            mesh.worldMaximum[axisIndex];
                     }
                 }
             }
@@ -13719,23 +16769,63 @@ static BOOL ApplyExportSizeSettings(
         MaxGLBExportMesh& mesh =
             meshes[meshIndex];
 
-        for (size_t positionIndex = 0;
-             positionIndex < mesh.positions.size();
-             ++positionIndex)
+        if (mesh.hasNodeTransform &&
+            !settings->preserveHierarchy)
         {
-            mesh.positions[positionIndex] *=
-                uniformScale;
+            ApplyUniformWorldScaleToGltfNodeMatrix(
+                mesh.nodeMatrix,
+                uniformScale);
+        }
+        else if (!mesh.hasNodeTransform)
+        {
+            for (size_t positionIndex = 0;
+                 positionIndex < mesh.positions.size();
+                 ++positionIndex)
+            {
+                mesh.positions[positionIndex] *=
+                    uniformScale;
+            }
+
+            for (int axisIndex = 0;
+                 axisIndex < 3;
+                 ++axisIndex)
+            {
+                mesh.minimum[axisIndex] *=
+                    uniformScale;
+
+                mesh.maximum[axisIndex] *=
+                    uniformScale;
+            }
         }
 
         for (int axisIndex = 0;
              axisIndex < 3;
              ++axisIndex)
         {
-            mesh.minimum[axisIndex] *=
+            mesh.worldMinimum[axisIndex] *=
                 uniformScale;
 
-            mesh.maximum[axisIndex] *=
+            mesh.worldMaximum[axisIndex] *=
                 uniformScale;
+        }
+    }
+
+    if (settings->preserveHierarchy)
+    {
+        for (size_t nodeIndex = 0;
+             nodeIndex < nodes.size();
+             ++nodeIndex)
+        {
+            MaxGLBExportNode& node =
+                nodes[nodeIndex];
+
+            if (node.parentIndex < 0 &&
+                node.hasTransform)
+            {
+                ApplyUniformWorldScaleToGltfNodeMatrix(
+                    node.matrix,
+                    uniformScale);
+            }
         }
     }
 
@@ -14207,6 +17297,7 @@ static size_t CountPrimitivesForGroup(
 static BOOL WriteGeometryGlbFile(
     const TCHAR* outputFilename,
     const std::vector<MaxGLBExportMesh>& meshes,
+    const std::vector<MaxGLBExportNode>& hierarchyNodes,
     BOOL selectedOnly,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -14250,7 +17341,11 @@ static BOOL WriteGeometryGlbFile(
     size_t nextAccessorIndex = 0;
     size_t nextMaterialIndex = 0;
     size_t nextTextureIndex = 0;
+    size_t nextSamplerIndex = 0;
     size_t nextImageIndex = 0;
+
+    BOOL usesTextureTransformExtension =
+        FALSE;
 
     for (size_t meshIndex = 0;
          meshIndex < meshes.size();
@@ -14338,6 +17433,31 @@ static BOOL WriteGeometryGlbFile(
                 layout.texcoordLength);
         }
 
+        if (mesh.hasTexcoords1)
+        {
+            PadBinaryToFourBytes(binaryData);
+
+            layout.texcoord1Offset =
+                binaryData.size();
+
+            layout.texcoord1Length =
+                mesh.texcoords1.size() *
+                sizeof(float);
+
+            layout.texcoord1BufferView =
+                nextBufferViewIndex++;
+
+            layout.texcoord1Accessor =
+                nextAccessorIndex++;
+
+            AppendBinaryBytes(
+                binaryData,
+                mesh.texcoords1.empty()
+                    ? NULL
+                    : &mesh.texcoords1[0],
+                layout.texcoord1Length);
+        }
+
         PadBinaryToFourBytes(binaryData);
 
         layout.indexOffset =
@@ -14395,9 +17515,6 @@ static BOOL WriteGeometryGlbFile(
                 layout.imageBufferView[roleIndex] =
                     nextBufferViewIndex++;
 
-                layout.textureIndex[roleIndex] =
-                    nextTextureIndex++;
-
                 layout.imageIndex[roleIndex] =
                     nextImageIndex++;
 
@@ -14405,6 +17522,43 @@ static BOOL WriteGeometryGlbFile(
                     binaryData,
                     &image.bytes[0],
                     image.bytes.size());
+            }
+
+            for (int usageIndex = 0;
+                 usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+                 ++usageIndex)
+            {
+                const MaxGLBExportTextureViewData& textureView =
+                    mesh.material.textureViews[
+                        usageIndex];
+
+                const int imageRole =
+                    MaxGLBTextureRoleForUsage(
+                        usageIndex);
+
+                layout.hasTextureView[usageIndex] =
+                    textureView.present &&
+                    layout.hasTexture[imageRole];
+
+                if (!layout.hasTextureView[
+                        usageIndex])
+                {
+                    continue;
+                }
+
+                layout.textureViewIndex[
+                    usageIndex] =
+                        nextTextureIndex++;
+
+                layout.samplerIndex[
+                    usageIndex] =
+                        nextSamplerIndex++;
+
+                if (textureView.hasTransform)
+                {
+                    usesTextureTransformExtension =
+                        TRUE;
+                }
             }
         }
     }
@@ -14417,6 +17571,53 @@ static BOOL WriteGeometryGlbFile(
     const size_t nodeGroupCount =
         CountExportNodeGroups(meshes);
 
+    std::vector<MaxGLBExportNode> exportNodes =
+        hierarchyNodes;
+
+    if (exportNodes.empty())
+    {
+        exportNodes.resize(
+            nodeGroupCount);
+
+        for (size_t groupIndex = 0;
+             groupIndex < nodeGroupCount;
+             ++groupIndex)
+        {
+            const MaxGLBExportMesh* firstPrimitive =
+                FindFirstExportPrimitiveForGroup(
+                    meshes,
+                    static_cast<int>(
+                        groupIndex));
+
+            exportNodes[groupIndex].name =
+                firstPrimitive != NULL
+                ? firstPrimitive->nodeName
+                : std::string("MaxGLB_Mesh");
+
+            exportNodes[groupIndex].meshGroupIndex =
+                static_cast<int>(
+                    groupIndex);
+
+            if (firstPrimitive != NULL &&
+                firstPrimitive->hasNodeTransform)
+            {
+                exportNodes[groupIndex].hasTransform =
+                    TRUE;
+
+                for (int matrixIndex = 0;
+                     matrixIndex < 16;
+                     ++matrixIndex)
+                {
+                    exportNodes[groupIndex]
+                        .matrix[matrixIndex] =
+                            firstPrimitive
+                                ->nodeMatrix[
+                                    matrixIndex];
+                }
+            }
+        }
+    }
+
     std::ostringstream json;
     json.imbue(std::locale::classic());
     json << std::setprecision(9);
@@ -14426,19 +17627,38 @@ static BOOL WriteGeometryGlbFile(
         << "\"asset\":{"
         << "\"version\":\"2.0\","
         << "\"generator\":\"MaxGLB2016\""
-        << "},"
-        << "\"scene\":0,"
+        << "}";
+
+    if (usesTextureTransformExtension)
+    {
+        json
+            << ",\"extensionsUsed\":["
+            << "\"KHR_texture_transform\""
+            << "]";
+    }
+
+    json
+        << ",\"scene\":0,"
         << "\"scenes\":[{\"nodes\":[";
 
+    BOOL firstSceneRoot = TRUE;
+
     for (size_t nodeIndex = 0;
-         nodeIndex < nodeGroupCount;
+         nodeIndex < exportNodes.size();
          ++nodeIndex)
     {
-        if (nodeIndex > 0)
+        if (exportNodes[nodeIndex]
+                .parentIndex >= 0)
+        {
+            continue;
+        }
+
+        if (!firstSceneRoot)
         {
             json << ",";
         }
 
+        firstSceneRoot = FALSE;
         json << nodeIndex;
     }
 
@@ -14447,7 +17667,7 @@ static BOOL WriteGeometryGlbFile(
         << "\"nodes\":[";
 
     for (size_t nodeIndex = 0;
-         nodeIndex < nodeGroupCount;
+         nodeIndex < exportNodes.size();
          ++nodeIndex)
     {
         if (nodeIndex > 0)
@@ -14455,23 +17675,71 @@ static BOOL WriteGeometryGlbFile(
             json << ",";
         }
 
-        const MaxGLBExportMesh* firstPrimitive =
-            FindFirstExportPrimitiveForGroup(
-                meshes,
-                static_cast<int>(
-                    nodeIndex));
+        const MaxGLBExportNode& node =
+            exportNodes[nodeIndex];
 
         json
             << "{"
-            << "\"mesh\":"
-            << nodeIndex
-            << ",\"name\":\""
+            << "\"name\":\""
             << EscapeJsonString(
-                firstPrimitive != NULL
-                    ? firstPrimitive->nodeName
-                    : std::string("MaxGLB_Mesh"))
-            << "\""
-            << "}";
+                node.name.empty()
+                    ? std::string("MaxGLB_Node")
+                    : node.name)
+            << "\"";
+
+        if (node.meshGroupIndex >= 0)
+        {
+            json
+                << ",\"mesh\":"
+                << node.meshGroupIndex;
+        }
+
+        if (node.hasTransform)
+        {
+            json
+                << ",\"matrix\":[";
+
+            for (int matrixIndex = 0;
+                 matrixIndex < 16;
+                 ++matrixIndex)
+            {
+                if (matrixIndex > 0)
+                {
+                    json << ",";
+                }
+
+                json
+                    << node.matrix[
+                        matrixIndex];
+            }
+
+            json << "]";
+        }
+
+        if (!node.children.empty())
+        {
+            json
+                << ",\"children\":[";
+
+            for (size_t childIndex = 0;
+                 childIndex <
+                    node.children.size();
+                 ++childIndex)
+            {
+                if (childIndex > 0)
+                {
+                    json << ",";
+                }
+
+                json
+                    << node.children[
+                        childIndex];
+            }
+
+            json << "]";
+        }
+
+        json << "}";
     }
 
     json
@@ -14542,6 +17810,13 @@ static BOOL WriteGeometryGlbFile(
                 json
                     << ",\"TEXCOORD_0\":"
                     << layout.texcoordAccessor;
+            }
+
+            if (mesh.hasTexcoords1)
+            {
+                json
+                    << ",\"TEXCOORD_1\":"
+                    << layout.texcoord1Accessor;
             }
 
             json
@@ -14625,6 +17900,21 @@ static BOOL WriteGeometryGlbFile(
                 << ","
                 << "\"byteLength\":"
                 << layout.texcoordLength
+                << ","
+                << "\"target\":34962"
+                << "}";
+        }
+
+        if (mesh.hasTexcoords1)
+        {
+            json
+                << ",{"
+                << "\"buffer\":0,"
+                << "\"byteOffset\":"
+                << layout.texcoord1Offset
+                << ","
+                << "\"byteLength\":"
+                << layout.texcoord1Length
                 << ","
                 << "\"target\":34962"
                 << "}";
@@ -14734,6 +18024,22 @@ static BOOL WriteGeometryGlbFile(
                 << "}";
         }
 
+        if (mesh.hasTexcoords1)
+        {
+            json
+                << ",{"
+                << "\"bufferView\":"
+                << layout.texcoord1BufferView
+                << ","
+                << "\"byteOffset\":0,"
+                << "\"componentType\":5126,"
+                << "\"count\":"
+                << (mesh.texcoords1.size() / 2)
+                << ","
+                << "\"type\":\"VEC2\""
+                << "}";
+        }
+
         json
             << ",{"
             << "\"bufferView\":"
@@ -14792,69 +18098,86 @@ static BOOL WriteGeometryGlbFile(
                 << mesh.material.baseColor[3]
                 << "],"
                 << "\"metallicFactor\":"
-                << (layout.hasTexture[
-                        MAXGLB_TEXTURE_ORM]
+                << (layout.hasTextureView[
+                        MAXGLB_USAGE_METALLIC_ROUGHNESS]
                     ? 1
                     : 0)
                 << ","
                 << "\"roughnessFactor\":1";
 
-            if (layout.hasTexture[
-                    MAXGLB_TEXTURE_BASE_COLOR])
+            if (layout.hasTextureView[
+                    MAXGLB_USAGE_BASE_COLOR])
             {
                 json
-                    << ",\"baseColorTexture\":{"
-                    << "\"index\":"
-                    << layout.textureIndex[
-                        MAXGLB_TEXTURE_BASE_COLOR]
-                    << "}";
+                    << ",\"baseColorTexture\":";
+
+                WriteGltfTextureInfo(
+                    json,
+                    layout.textureViewIndex[
+                        MAXGLB_USAGE_BASE_COLOR],
+                    mesh.material.textureViews[
+                        MAXGLB_USAGE_BASE_COLOR]);
             }
 
-            if (layout.hasTexture[
-                    MAXGLB_TEXTURE_ORM])
+            if (layout.hasTextureView[
+                    MAXGLB_USAGE_METALLIC_ROUGHNESS])
             {
                 json
-                    << ",\"metallicRoughnessTexture\":{"
-                    << "\"index\":"
-                    << layout.textureIndex[
-                        MAXGLB_TEXTURE_ORM]
-                    << "}";
+                    << ",\"metallicRoughnessTexture\":";
+
+                WriteGltfTextureInfo(
+                    json,
+                    layout.textureViewIndex[
+                        MAXGLB_USAGE_METALLIC_ROUGHNESS],
+                    mesh.material.textureViews[
+                        MAXGLB_USAGE_METALLIC_ROUGHNESS]);
             }
 
             json << "}";
 
-            if (layout.hasTexture[
-                    MAXGLB_TEXTURE_NORMAL])
+            if (layout.hasTextureView[
+                    MAXGLB_USAGE_NORMAL])
             {
                 json
-                    << ",\"normalTexture\":{"
-                    << "\"index\":"
-                    << layout.textureIndex[
-                        MAXGLB_TEXTURE_NORMAL]
-                    << "}";
+                    << ",\"normalTexture\":";
+
+                WriteGltfTextureInfo(
+                    json,
+                    layout.textureViewIndex[
+                        MAXGLB_USAGE_NORMAL],
+                    mesh.material.textureViews[
+                        MAXGLB_USAGE_NORMAL]);
             }
 
-            if (layout.hasTexture[
-                    MAXGLB_TEXTURE_ORM])
+            if (layout.hasTextureView[
+                    MAXGLB_USAGE_OCCLUSION])
             {
                 json
-                    << ",\"occlusionTexture\":{"
-                    << "\"index\":"
-                    << layout.textureIndex[
-                        MAXGLB_TEXTURE_ORM]
-                    << "}";
+                    << ",\"occlusionTexture\":";
+
+                WriteGltfTextureInfo(
+                    json,
+                    layout.textureViewIndex[
+                        MAXGLB_USAGE_OCCLUSION],
+                    mesh.material.textureViews[
+                        MAXGLB_USAGE_OCCLUSION]);
             }
 
-            if (layout.hasTexture[
-                    MAXGLB_TEXTURE_EMISSIVE])
+            if (layout.hasTextureView[
+                    MAXGLB_USAGE_EMISSIVE])
             {
                 json
-                    << ",\"emissiveTexture\":{"
-                    << "\"index\":"
-                    << layout.textureIndex[
-                        MAXGLB_TEXTURE_EMISSIVE]
-                    << "},"
-                    << "\"emissiveFactor\":[1,1,1]";
+                    << ",\"emissiveTexture\":";
+
+                WriteGltfTextureInfo(
+                    json,
+                    layout.textureViewIndex[
+                        MAXGLB_USAGE_EMISSIVE],
+                    mesh.material.textureViews[
+                        MAXGLB_USAGE_EMISSIVE]);
+
+                json
+                    << ",\"emissiveFactor\":[1,1,1]";
             }
 
             if (mesh.material.doubleSided)
@@ -14887,12 +18210,56 @@ static BOOL WriteGeometryGlbFile(
     if (nextTextureIndex > 0)
     {
         json
-            << ",\"samplers\":[{"
-            << "\"magFilter\":9729,"
-            << "\"minFilter\":9987,"
-            << "\"wrapS\":10497,"
-            << "\"wrapT\":10497"
-            << "}]";
+            << ",\"samplers\":[";
+
+        BOOL firstSampler = TRUE;
+
+        for (size_t meshIndex = 0;
+             meshIndex < meshes.size();
+             ++meshIndex)
+        {
+            const MaxGLBExportMesh& mesh =
+                meshes[meshIndex];
+
+            const MaxGLBExportLayout& layout =
+                layouts[meshIndex];
+
+            for (int usageIndex = 0;
+                 usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+                 ++usageIndex)
+            {
+                if (!layout.hasTextureView[
+                        usageIndex])
+                {
+                    continue;
+                }
+
+                if (!firstSampler)
+                {
+                    json << ",";
+                }
+
+                firstSampler = FALSE;
+
+                const MaxGLBExportTextureViewData& view =
+                    mesh.material.textureViews[
+                        usageIndex];
+
+                json
+                    << "{"
+                    << "\"magFilter\":"
+                    << view.magFilter
+                    << ",\"minFilter\":"
+                    << view.minFilter
+                    << ",\"wrapS\":"
+                    << view.wrapS
+                    << ",\"wrapT\":"
+                    << view.wrapT
+                    << "}";
+            }
+        }
+
+        json << "]";
 
         json << ",\"textures\":[";
 
@@ -14905,11 +18272,12 @@ static BOOL WriteGeometryGlbFile(
             const MaxGLBExportLayout& layout =
                 layouts[meshIndex];
 
-            for (int roleIndex = 0;
-                 roleIndex < MAXGLB_TEXTURE_COUNT;
-                 ++roleIndex)
+            for (int usageIndex = 0;
+                 usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+                 ++usageIndex)
             {
-                if (!layout.hasTexture[roleIndex])
+                if (!layout.hasTextureView[
+                        usageIndex])
                 {
                     continue;
                 }
@@ -14921,11 +18289,18 @@ static BOOL WriteGeometryGlbFile(
 
                 firstTexture = FALSE;
 
+                const int imageRole =
+                    MaxGLBTextureRoleForUsage(
+                        usageIndex);
+
                 json
                     << "{"
-                    << "\"sampler\":0,"
-                    << "\"source\":"
-                    << layout.imageIndex[roleIndex]
+                    << "\"sampler\":"
+                    << layout.samplerIndex[
+                        usageIndex]
+                    << ",\"source\":"
+                    << layout.imageIndex[
+                        imageRole]
                     << "}";
             }
         }
@@ -14993,8 +18368,8 @@ static BOOL WriteGeometryGlbFile(
                 ? "selected"
                 : "scene")
         << "\","
-        << "\"geometryStage\":9,"
-        << "\"materialStage\":\"multiSubObject\""
+        << "\"geometryStage\":13,"
+        << "\"materialStage\":\"textureTransformSampling\""
         << "}"
         << "}";
 
@@ -15212,7 +18587,7 @@ public:
 
     unsigned int Version()
     {
-        return 111;
+        return 116;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -15337,22 +18712,26 @@ public:
         DeleteFile(temporaryFilename);
 
         std::vector<MaxGLBExportMesh> meshes;
+        std::vector<MaxGLBExportNode> exportNodes;
 
         if (!CollectMeshesForExport(
                 maxInterface,
                 selectedOnly,
                 exportSettings,
                 meshes,
+                exportNodes,
                 errorMessage,
                 _countof(errorMessage)) ||
             !ApplyExportSizeSettings(
                 meshes,
+                exportNodes,
                 &exportSettings,
                 errorMessage,
                 _countof(errorMessage)) ||
             !WriteGeometryGlbFile(
                 temporaryFilename,
                 meshes,
+                exportNodes,
                 selectedOnly,
                 errorMessage,
                 _countof(errorMessage)) ||
@@ -15406,6 +18785,10 @@ public:
         size_t totalVertexCount = 0;
         size_t totalTriangleCount = 0;
         size_t primitivesWithUvs = 0;
+        size_t primitivesWithUv2 = 0;
+        size_t transformedTextureViews = 0;
+        size_t clampTextureViews = 0;
+        size_t mirroredTextureViews = 0;
         size_t multiMaterialObjects = 0;
         size_t exportedMaterials = 0;
         size_t exportedBaseColorTextures = 0;
@@ -15431,6 +18814,52 @@ public:
             if (meshes[meshIndex].hasTexcoords)
             {
                 ++primitivesWithUvs;
+            }
+
+            if (meshes[meshIndex].hasTexcoords1)
+            {
+                ++primitivesWithUv2;
+            }
+
+            for (int usageIndex = 0;
+                 usageIndex < MAXGLB_TEXTURE_USAGE_COUNT;
+                 ++usageIndex)
+            {
+                const MaxGLBExportTextureViewData& view =
+                    meshes[meshIndex]
+                        .material
+                        .textureViews[
+                            usageIndex];
+
+                if (!view.present)
+                {
+                    continue;
+                }
+
+                if (view.hasTransform)
+                {
+                    ++transformedTextureViews;
+                }
+
+                if (view.wrapS ==
+                        static_cast<int>(
+                            cgltf_wrap_mode_clamp_to_edge) ||
+                    view.wrapT ==
+                        static_cast<int>(
+                            cgltf_wrap_mode_clamp_to_edge))
+                {
+                    ++clampTextureViews;
+                }
+
+                if (view.wrapS ==
+                        static_cast<int>(
+                            cgltf_wrap_mode_mirrored_repeat) ||
+                    view.wrapT ==
+                        static_cast<int>(
+                            cgltf_wrap_mode_mirrored_repeat))
+                {
+                    ++mirroredTextureViews;
+                }
             }
 
             if (meshes[meshIndex].material.present)
@@ -15507,7 +18936,11 @@ public:
                 _T("Multi-material objects: %u\n")
                 _T("Export vertices: %u\n")
                 _T("Triangles: %u\n")
-                _T("Primitives with UV channel 1: %u\n")
+                _T("Primitives with UV channel 1 / TEXCOORD_0: %u\n")
+                _T("Primitives with UV channel 2 / TEXCOORD_1: %u\n")
+                _T("Transformed texture views: %u\n")
+                _T("Clamp texture views: %u\n")
+                _T("Mirrored-repeat texture views: %u\n")
                 _T("Standard sub-materials: %u\n")
                 _T("Base-color textures: %u\n")
                 _T("Normal textures: %u\n")
@@ -15519,6 +18952,8 @@ public:
                 _T("Export settings:\n")
                 _T("- size mode: %s\n")
                 _T("- applied uniform scale: %.7g\n")
+                _T("- transform mode: %s\n")
+                _T("- hierarchy preserved: %s\n")
                 _T("- materials: %s\n")
                 _T("- textures embedded in GLB: %s\n")
                 _T("- alpha mode setting: %s\n")
@@ -15526,10 +18961,13 @@ public:
                 _T("- animation: not exported\n\n")
                 _T("Geometry:\n")
                 _T("- evaluated modifier stack\n")
-                _T("- object transforms baked into geometry\n")
+                _T("- object transforms handled according to transform mode\n")
+                _T("- pivots preserved when Preserve mode is selected\n")
                 _T("- Max Z-up converted to glTF Y-up\n")
-                _T("- explicit normals and UV channel 1\n")
+                _T("- explicit normals and UV channels 1/2\n")
                 _T("- hard edges and UV seams preserved\n")
+                _T("- KHR_texture_transform offset/scale/rotation\n")
+                _T("- REPEAT / CLAMP_TO_EDGE / MIRRORED_REPEAT samplers\n")
                 _T("- Face Material IDs exported as glTF primitives\n")
                 _T("- Multi/Sub-Object sub-materials preserved\n\n")
                 _T("Output:\n%s%s"),
@@ -15548,6 +18986,14 @@ public:
                     totalTriangleCount),
                 static_cast<unsigned int>(
                     primitivesWithUvs),
+                static_cast<unsigned int>(
+                    primitivesWithUv2),
+                static_cast<unsigned int>(
+                    transformedTextureViews),
+                static_cast<unsigned int>(
+                    clampTextureViews),
+                static_cast<unsigned int>(
+                    mirroredTextureViews),
                 static_cast<unsigned int>(
                     exportedMaterials),
                 static_cast<unsigned int>(
@@ -15568,6 +19014,13 @@ public:
                     ? _T("normalize largest dimension")
                     : _T("uniform scale factor"),
                 exportSettings.appliedUniformScale,
+                exportSettings.transformMode ==
+                        MAXGLB_TRANSFORM_PRESERVE
+                    ? _T("Preserve transforms and pivots")
+                    : _T("Bake transforms into geometry"),
+                exportSettings.preserveHierarchy
+                    ? _T("yes")
+                    : _T("no"),
                 exportSettings.exportMaterials
                     ? _T("yes")
                     : _T("no"),

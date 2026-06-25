@@ -3,7 +3,7 @@
 GLB import and export for Autodesk 3ds Max 2016, focused on practical static-model workflows.
 
 <p align="center">
-  <img src="docs/images/hero-preview.jpg"
+  <img src="docs/images/hero-preview.png"
        alt="MaxGLB2016 importing and exporting a GLB model in Autodesk 3ds Max 2016"
        width="100%">
 </p>

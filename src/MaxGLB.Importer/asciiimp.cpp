@@ -101,6 +101,218 @@ static MaxGLBImportSettings g_lastImportSettings;
 
 static MaxGLBExportSettings g_lastExportSettings;
 
+
+struct MaxGLBProgressState
+{
+    Interface* maxInterface;
+    BOOL active;
+    BOOL cancelled;
+    int lastPercent;
+
+    MaxGLBProgressState()
+        : maxInterface(NULL)
+        , active(FALSE)
+        , cancelled(FALSE)
+        , lastPercent(-1)
+    {
+    }
+};
+
+
+static MaxGLBProgressState g_maxGLBProgress;
+static int g_activeImportPrimitiveCount = 1;
+
+
+// 3ds Max 2016's four-argument ProgressStart implementation dereferences
+// the worker callback even though newer SDK documentation allows NULL.
+// A tiny valid callback prevents the null-function-pointer crash while the
+// importer/exporter continues to perform the work synchronously and calls
+// ProgressUpdate itself.
+static DWORD WINAPI MaxGLBProgressWorkerStub(
+    LPVOID argument)
+{
+    UNREFERENCED_PARAMETER(argument);
+    return 0;
+}
+
+
+static int g_exportProgressTotalNodes = 1;
+static int g_exportProgressProcessedNodes = 0;
+
+
+static void BeginMaxGLBProgress(
+    Interface* maxInterface,
+    const TCHAR* taskName)
+{
+    g_maxGLBProgress.maxInterface =
+        maxInterface;
+
+    g_maxGLBProgress.active =
+        FALSE;
+
+    g_maxGLBProgress.cancelled =
+        FALSE;
+
+    g_maxGLBProgress.lastPercent =
+        -1;
+
+    if (maxInterface == NULL)
+    {
+        return;
+    }
+
+    maxInterface->SetCancel(FALSE);
+
+    const BOOL progressStarted =
+        maxInterface->ProgressStart(
+            const_cast<TCHAR*>(taskName),
+            TRUE,
+            MaxGLBProgressWorkerStub,
+            NULL);
+
+    g_maxGLBProgress.active =
+        progressStarted;
+}
+
+
+static BOOL UpdateMaxGLBProgress(
+    int percent,
+    const TCHAR* stepName)
+{
+    if (percent < 0)
+    {
+        percent = 0;
+    }
+    else if (percent > 100)
+    {
+        percent = 100;
+    }
+
+    Interface* maxInterface =
+        g_maxGLBProgress.maxInterface;
+
+    if (maxInterface == NULL)
+    {
+        return TRUE;
+    }
+
+    if (!g_maxGLBProgress.active)
+    {
+        return TRUE;
+    }
+
+    if (percent != g_maxGLBProgress.lastPercent ||
+        stepName != NULL)
+    {
+        maxInterface->ProgressUpdate(
+            percent,
+            TRUE,
+            const_cast<TCHAR*>(stepName));
+
+        g_maxGLBProgress.lastPercent =
+            percent;
+    }
+
+    if (maxInterface->GetCancel())
+    {
+        g_maxGLBProgress.cancelled =
+            TRUE;
+
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static BOOL ContinueMaxGLBOperation(
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (UpdateMaxGLBProgress(
+            g_maxGLBProgress.lastPercent < 0
+                ? 0
+                : g_maxGLBProgress.lastPercent,
+            NULL))
+    {
+        return TRUE;
+    }
+
+    if (errorMessage != NULL &&
+        errorMessageCount > 0)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Operation cancelled by the user."));
+    }
+
+    return FALSE;
+}
+
+
+static BOOL MaxGLBOperationWasCancelled()
+{
+    return g_maxGLBProgress.cancelled;
+}
+
+
+static void EndMaxGLBProgress()
+{
+    Interface* maxInterface =
+        g_maxGLBProgress.maxInterface;
+
+    if (maxInterface != NULL)
+    {
+        if (g_maxGLBProgress.active)
+        {
+            maxInterface->ProgressEnd();
+        }
+
+        maxInterface->SetCancel(FALSE);
+    }
+
+    g_maxGLBProgress =
+        MaxGLBProgressState();
+}
+
+
+static int CountSceneNodesRecursive(
+    INode* parentNode)
+{
+    if (parentNode == NULL)
+    {
+        return 0;
+    }
+
+    int result = 0;
+
+    const int childCount =
+        parentNode->NumberOfChildren();
+
+    for (int childIndex = 0;
+         childIndex < childCount;
+         ++childIndex)
+    {
+        INode* childNode =
+            parentNode->GetChildNode(
+                childIndex);
+
+        if (childNode == NULL)
+        {
+            continue;
+        }
+
+        ++result;
+
+        result +=
+            CountSceneNodesRecursive(
+                childNode);
+    }
+
+    return result;
+}
+
 // Eigene, dauerhafte Class-ID fuer MaxGLB2016.
 // Diese Werte spaeter nicht mehr veraendern.
 #define MAXGLB_IMPORTER_CLASS_ID \
@@ -6663,6 +6875,44 @@ static BOOL ImportPrimitiveAsNode(
         return TRUE;
     }
 
+    TCHAR importProgressName[320];
+
+    BuildImportedNodeName(
+        sourceNode,
+        sourceMesh,
+        primitiveIndex,
+        importObjectIndex,
+        importProgressName,
+        _countof(importProgressName));
+
+    TCHAR importProgressStep[384];
+
+    _stprintf_s(
+        importProgressStep,
+        _countof(importProgressStep),
+        _T("Importing %s (%d of %d)"),
+        importProgressName,
+        importObjectIndex + 1,
+        g_activeImportPrimitiveCount);
+
+    const int importProgressPercent =
+        5 +
+        (importObjectIndex * 88) /
+        (g_activeImportPrimitiveCount > 0
+            ? g_activeImportPrimitiveCount
+            : 1);
+
+    if (!UpdateMaxGLBProgress(
+            importProgressPercent,
+            importProgressStep))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
     const cgltf_accessor* positionAccessor =
         cgltf_find_accessor(
             primitive,
@@ -6836,6 +7086,14 @@ static BOOL ImportPrimitiveAsNode(
          sourceVertexIndex < positionAccessor->count;
          ++sourceVertexIndex)
     {
+        if ((sourceVertexIndex & 4095) == 0 &&
+            !ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+
         cgltf_float localPosition[3];
 
         if (!cgltf_accessor_read_float(
@@ -6976,6 +7234,15 @@ static BOOL ImportPrimitiveAsNode(
          sourceVertexIndex < positionAccessor->count;
          ++sourceVertexIndex)
     {
+        if ((sourceVertexIndex & 4095) == 0 &&
+            !ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            triObject->DeleteThis();
+            return FALSE;
+        }
+
         if (hasUvChannel)
         {
             cgltf_float texCoord[2];
@@ -7039,6 +7306,15 @@ static BOOL ImportPrimitiveAsNode(
          faceIndex < faceCount;
          ++faceIndex)
     {
+        if ((faceIndex & 4095) == 0 &&
+            !ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            triObject->DeleteThis();
+            return FALSE;
+        }
+
         cgltf_size sourceIndex0;
         cgltf_size sourceIndex1;
         cgltf_size sourceIndex2;
@@ -7152,6 +7428,25 @@ static BOOL ImportPrimitiveAsNode(
     g_importTextureSetIndex =
         importObjectIndex;
 
+    _stprintf_s(
+        importProgressStep,
+        _countof(importProgressStep),
+        _T("Creating material for %s"),
+        importProgressName);
+
+    if (!UpdateMaxGLBProgress(
+            importProgressPercent,
+            importProgressStep))
+    {
+        triObject->DeleteThis();
+
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
     if (!CreateStandardMaterialForPrimitive(
             primitive,
             sourceFilename,
@@ -7262,6 +7557,24 @@ static BOOL ImportPrimitiveAsNode(
         ++importStats->emissiveTextures;
     }
 
+    const int completedImportPercent =
+        5 +
+        (importStats->objectCount * 88) /
+        (g_activeImportPrimitiveCount > 0
+            ? g_activeImportPrimitiveCount
+            : 1);
+
+    if (!UpdateMaxGLBProgress(
+            completedImportPercent,
+            importProgressStep))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
     return TRUE;
 }
 
@@ -7290,6 +7603,13 @@ static BOOL ImportNodeMeshesRecursive(
              primitiveIndex < sourceMesh->primitives_count;
              ++primitiveIndex)
         {
+            if (!ContinueMaxGLBOperation(
+                    errorMessage,
+                    errorMessageCount))
+            {
+                return FALSE;
+            }
+
             cgltf_primitive* primitive =
                 &sourceMesh->primitives[
                     primitiveIndex];
@@ -7619,6 +7939,17 @@ static BOOL ImportAllSceneMeshes(
         return FALSE;
     }
 
+    if (!UpdateMaxGLBProgress(
+            96,
+            _T("Creating optional root node...")))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
     if (!CreateImportedParentNode(
             data,
             sourceFilename,
@@ -7683,7 +8014,7 @@ public:
 
     unsigned int Version()
     {
-        return 101;
+        return 103;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -7920,6 +8251,24 @@ public:
         g_splitOrmImagesThisImport.clear();
         g_unchangedImagesThisImport.clear();
 
+        g_activeImportPrimitiveCount =
+            CountImportableScenePrimitives(data);
+
+        if (g_activeImportPrimitiveCount <= 0)
+        {
+            g_activeImportPrimitiveCount = 1;
+        }
+
+        BeginMaxGLBProgress(
+            suppressPrompts
+                ? NULL
+                : maxInterface,
+            _T("MaxGLB2016 Import"));
+
+        UpdateMaxGLBProgress(
+            1,
+            _T("Preparing GLB scene..."));
+
         MaxGLBImportStats importStats;
 
         TCHAR importError[512];
@@ -7932,6 +8281,8 @@ public:
                 g_activeImportSettings.normalizeTargetSize,
                 &g_activeImportSettings.appliedUniformScale))
         {
+            EndMaxGLBProgress();
+
             g_activeImportData = NULL;
             g_splitOrmImagesThisImport.clear();
             g_unchangedImagesThisImport.clear();
@@ -7950,6 +8301,14 @@ public:
             return IMPEXP_FAIL;
         }
 
+        UpdateMaxGLBProgress(
+            3,
+            _T("Calculating import transforms..."));
+
+        // A single Hold transaction makes the complete import one Ctrl+Z
+        // operation. Cancel restores the scene to its state before import.
+        theHold.Begin();
+
         BOOL importSucceeded =
             ImportAllSceneMeshes(
                 data,
@@ -7959,6 +8318,26 @@ public:
                 importError,
                 _countof(importError));
 
+        const BOOL importWasCancelled =
+            MaxGLBOperationWasCancelled();
+
+        if (importSucceeded &&
+            !importWasCancelled)
+        {
+            UpdateMaxGLBProgress(
+                100,
+                _T("Import complete"));
+
+            theHold.Accept(
+                _T("Import GLB"));
+        }
+        else
+        {
+            theHold.Cancel();
+        }
+
+        EndMaxGLBProgress();
+
         g_activeImportData = NULL;
         g_splitOrmImagesThisImport.clear();
         g_unchangedImagesThisImport.clear();
@@ -7966,8 +8345,20 @@ public:
         cgltf_free(data);
         free(fileBytes);
 
-        if (!importSucceeded)
+        if (!importSucceeded ||
+            importWasCancelled)
         {
+            if (maxInterface != NULL)
+            {
+                maxInterface->RedrawViews(
+                    maxInterface->GetTime());
+            }
+
+            if (importWasCancelled)
+            {
+                return IMPEXP_CANCEL;
+            }
+
             if (!suppressPrompts)
             {
                 ShowImportMessage(
@@ -10147,6 +10538,35 @@ static BOOL TryBuildExportMesh(
         return TRUE;
     }
 
+
+    TCHAR exportProgressStep[384];
+
+    _stprintf_s(
+        exportProgressStep,
+        _countof(exportProgressStep),
+        _T("Processing %s (%d of %d)"),
+        node->GetName(),
+        g_exportProgressProcessedNodes + 1,
+        g_exportProgressTotalNodes);
+
+    const int exportNodePercent =
+        2 +
+        (g_exportProgressProcessedNodes * 68) /
+        (g_exportProgressTotalNodes > 0
+            ? g_exportProgressTotalNodes
+            : 1);
+
+    if (!UpdateMaxGLBProgress(
+            exportNodePercent,
+            exportProgressStep))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Export cancelled by the user."));
+        return FALSE;
+    }
+
     const ObjectState& objectState =
         node->EvalWorldState(timeValue);
 
@@ -10284,6 +10704,19 @@ static BOOL TryBuildExportMesh(
          faceIndex < faceCount;
          ++faceIndex)
     {
+        if ((faceIndex & 4095) == 0 &&
+            !ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            if (deleteConvertedObject)
+            {
+                triangleObject->DeleteThis();
+            }
+
+            return FALSE;
+        }
+
         const Face& face =
             mesh.faces[faceIndex];
 
@@ -10600,6 +11033,8 @@ static BOOL CollectSceneMeshesRecursive(
             return FALSE;
         }
 
+        ++g_exportProgressProcessedNodes;
+
         if (wasGeometry)
         {
             outputMeshes.push_back(
@@ -10679,6 +11114,8 @@ static BOOL CollectMeshesForExport(
                 return FALSE;
             }
 
+            ++g_exportProgressProcessedNodes;
+
             if (wasGeometry)
             {
                 outputMeshes.push_back(
@@ -10722,6 +11159,17 @@ static BOOL ApplyExportSizeSettings(
     TCHAR* errorMessage,
     size_t errorMessageCount)
 {
+    if (!UpdateMaxGLBProgress(
+            72,
+            _T("Applying export size settings...")))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Export cancelled by the user."));
+        return FALSE;
+    }
+
     if (settings == NULL ||
         meshes.empty())
     {
@@ -10839,6 +11287,13 @@ static BOOL ApplyExportSizeSettings(
          meshIndex < meshes.size();
          ++meshIndex)
     {
+        if (!ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+
         MaxGLBExportMesh& mesh =
             meshes[meshIndex];
 
@@ -10899,6 +11354,367 @@ static void ShowExportedFileInExplorer(
 }
 
 
+static BOOL WriteCancelableBlock(
+    FILE* outputFile,
+    const void* sourceData,
+    size_t byteCount,
+    int startPercent,
+    int endPercent,
+    const TCHAR* stepName,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (byteCount == 0)
+    {
+        return TRUE;
+    }
+
+    if (outputFile == NULL ||
+        sourceData == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Invalid output data was supplied while writing the GLB."));
+        return FALSE;
+    }
+
+    const unsigned char* sourceBytes =
+        reinterpret_cast<const unsigned char*>(
+            sourceData);
+
+    const size_t chunkSize =
+        1024 * 1024;
+
+    size_t writtenTotal = 0;
+
+    while (writtenTotal < byteCount)
+    {
+        if (!ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+
+        const size_t remaining =
+            byteCount - writtenTotal;
+
+        const size_t thisChunk =
+            remaining < chunkSize
+                ? remaining
+                : chunkSize;
+
+        if (fwrite(
+                sourceBytes + writtenTotal,
+                1,
+                thisChunk,
+                outputFile) != thisChunk)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The GLB file could not be written completely."));
+            return FALSE;
+        }
+
+        writtenTotal +=
+            thisChunk;
+
+        const int percent =
+            startPercent +
+            static_cast<int>(
+                (writtenTotal *
+                 static_cast<size_t>(
+                    endPercent - startPercent)) /
+                byteCount);
+
+        if (!UpdateMaxGLBProgress(
+                percent,
+                stepName))
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("Export cancelled by the user."));
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+
+static BOOL BuildTemporaryExportFilename(
+    const TCHAR* outputFilename,
+    TCHAR* temporaryFilename,
+    size_t temporaryFilenameCount)
+{
+    if (outputFilename == NULL ||
+        outputFilename[0] == _T('\0') ||
+        temporaryFilename == NULL ||
+        temporaryFilenameCount == 0)
+    {
+        return FALSE;
+    }
+
+    return _stprintf_s(
+        temporaryFilename,
+        temporaryFilenameCount,
+        _T("%s.MaxGLB2016.tmp"),
+        outputFilename) >= 0;
+}
+
+
+static BOOL BuildAlternateExportFilename(
+    const TCHAR* requestedFilename,
+    TCHAR* alternateFilename,
+    size_t alternateFilenameCount)
+{
+    if (requestedFilename == NULL ||
+        requestedFilename[0] == _T('\0') ||
+        alternateFilename == NULL ||
+        alternateFilenameCount == 0)
+    {
+        return FALSE;
+    }
+
+    const TCHAR* lastBackslash =
+        _tcsrchr(
+            requestedFilename,
+            _T('\\'));
+
+    const TCHAR* lastForwardSlash =
+        _tcsrchr(
+            requestedFilename,
+            _T('/'));
+
+    const TCHAR* lastSlash =
+        lastBackslash;
+
+    if (lastForwardSlash != NULL &&
+        (lastSlash == NULL ||
+         lastForwardSlash > lastSlash))
+    {
+        lastSlash =
+            lastForwardSlash;
+    }
+
+    const TCHAR* extension =
+        _tcsrchr(
+            requestedFilename,
+            _T('.'));
+
+    if (extension == NULL ||
+        (lastSlash != NULL &&
+         extension < lastSlash))
+    {
+        extension =
+            requestedFilename +
+            _tcslen(requestedFilename);
+    }
+
+    const size_t prefixLength =
+        static_cast<size_t>(
+            extension - requestedFilename);
+
+    for (int candidateIndex = 1;
+         candidateIndex <= 999;
+         ++candidateIndex)
+    {
+        const int written =
+            candidateIndex == 1
+                ? _stprintf_s(
+                    alternateFilename,
+                    alternateFilenameCount,
+                    _T("%.*s_new%s"),
+                    static_cast<int>(
+                        prefixLength),
+                    requestedFilename,
+                    extension)
+                : _stprintf_s(
+                    alternateFilename,
+                    alternateFilenameCount,
+                    _T("%.*s_new_%d%s"),
+                    static_cast<int>(
+                        prefixLength),
+                    requestedFilename,
+                    candidateIndex,
+                    extension);
+
+        if (written < 0)
+        {
+            return FALSE;
+        }
+
+        if (GetFileAttributes(
+                alternateFilename) ==
+            INVALID_FILE_ATTRIBUTES)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static BOOL CommitTemporaryExportFile(
+    const TCHAR* temporaryFilename,
+    const TCHAR* requestedOutputFilename,
+    TCHAR* actualOutputFilename,
+    size_t actualOutputFilenameCount,
+    BOOL* usedAlternateFilename,
+    DWORD* replacementError,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (actualOutputFilename == NULL ||
+        actualOutputFilenameCount == 0)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("The final export filename buffer is invalid."));
+        return FALSE;
+    }
+
+    _tcscpy_s(
+        actualOutputFilename,
+        actualOutputFilenameCount,
+        requestedOutputFilename);
+
+    if (usedAlternateFilename != NULL)
+    {
+        *usedAlternateFilename =
+            FALSE;
+    }
+
+    if (replacementError != NULL)
+    {
+        *replacementError =
+            ERROR_SUCCESS;
+    }
+
+    DWORD originalAttributes =
+        GetFileAttributes(
+            requestedOutputFilename);
+
+    const BOOL outputAlreadyExists =
+        originalAttributes !=
+            INVALID_FILE_ATTRIBUTES;
+
+    const BOOL outputWasReadOnly =
+        outputAlreadyExists &&
+        (originalAttributes &
+         FILE_ATTRIBUTE_READONLY) != 0;
+
+    if (outputWasReadOnly)
+    {
+        SetFileAttributes(
+            requestedOutputFilename,
+            originalAttributes &
+                ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    BOOL committed = FALSE;
+
+    if (outputAlreadyExists)
+    {
+        committed =
+            ReplaceFile(
+                requestedOutputFilename,
+                temporaryFilename,
+                NULL,
+                REPLACEFILE_WRITE_THROUGH,
+                NULL,
+                NULL);
+    }
+    else
+    {
+        committed =
+            MoveFileEx(
+                temporaryFilename,
+                requestedOutputFilename,
+                MOVEFILE_WRITE_THROUGH);
+    }
+
+    if (committed)
+    {
+        if (outputWasReadOnly)
+        {
+            SetFileAttributes(
+                requestedOutputFilename,
+                originalAttributes);
+        }
+
+        return TRUE;
+    }
+
+    const DWORD win32Error =
+        GetLastError();
+
+    if (replacementError != NULL)
+    {
+        *replacementError =
+            win32Error;
+    }
+
+    if (outputWasReadOnly)
+    {
+        SetFileAttributes(
+            requestedOutputFilename,
+            originalAttributes);
+    }
+
+    // Viewers often keep the current GLB open without FILE_SHARE_DELETE.
+    // Windows then refuses an atomic replacement with error 5 or 32.
+    // Preserve the completed export under a unique sibling filename.
+    if (win32Error == ERROR_ACCESS_DENIED ||
+        win32Error == ERROR_SHARING_VIOLATION ||
+        win32Error == ERROR_LOCK_VIOLATION)
+    {
+        TCHAR alternateFilename[2048];
+        alternateFilename[0] =
+            _T('\0');
+
+        if (BuildAlternateExportFilename(
+                requestedOutputFilename,
+                alternateFilename,
+                _countof(alternateFilename)) &&
+            MoveFileEx(
+                temporaryFilename,
+                alternateFilename,
+                MOVEFILE_WRITE_THROUGH))
+        {
+            _tcscpy_s(
+                actualOutputFilename,
+                actualOutputFilenameCount,
+                alternateFilename);
+
+            if (usedAlternateFilename != NULL)
+            {
+                *usedAlternateFilename =
+                    TRUE;
+            }
+
+            return TRUE;
+        }
+    }
+
+    _stprintf_s(
+        errorMessage,
+        errorMessageCount,
+        _T("The temporary GLB was written, but Windows could not finalize the output file.\n\n")
+        _T("Windows error: %lu\n\n")
+        _T("The destination may be open in another program, read-only, or protected."),
+        static_cast<unsigned long>(
+            win32Error));
+
+    return FALSE;
+}
+
+
 static BOOL WriteGeometryGlbFile(
     const TCHAR* outputFilename,
     const std::vector<MaxGLBExportMesh>& meshes,
@@ -10906,6 +11722,17 @@ static BOOL WriteGeometryGlbFile(
     TCHAR* errorMessage,
     size_t errorMessageCount)
 {
+    if (!UpdateMaxGLBProgress(
+            76,
+            _T("Packing GLB buffers and textures...")))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Export cancelled by the user."));
+        return FALSE;
+    }
+
     if (outputFilename == NULL ||
         outputFilename[0] == _T('\0'))
     {
@@ -10940,6 +11767,13 @@ static BOOL WriteGeometryGlbFile(
          meshIndex < meshes.size();
          ++meshIndex)
     {
+        if (!ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            return FALSE;
+        }
+
         const MaxGLBExportMesh& mesh =
             meshes[meshIndex];
 
@@ -11709,12 +12543,15 @@ static BOOL WriteGeometryGlbFile(
     }
 
     if (writeSucceeded &&
-        fwrite(
+        !WriteCancelableBlock(
+            outputFile,
             jsonText.data(),
-            1,
             jsonText.size(),
-            outputFile) !=
-                jsonText.size())
+            82,
+            85,
+            _T("Writing GLB metadata..."),
+            errorMessage,
+            errorMessageCount))
     {
         writeSucceeded = FALSE;
     }
@@ -11749,12 +12586,15 @@ static BOOL WriteGeometryGlbFile(
 
     if (writeSucceeded &&
         !binaryData.empty() &&
-        fwrite(
+        !WriteCancelableBlock(
+            outputFile,
             &binaryData[0],
-            1,
             binaryData.size(),
-            outputFile) !=
-                binaryData.size())
+            86,
+            99,
+            _T("Writing geometry and embedded textures..."),
+            errorMessage,
+            errorMessageCount))
     {
         writeSucceeded = FALSE;
     }
@@ -11765,10 +12605,16 @@ static BOOL WriteGeometryGlbFile(
     {
         DeleteFile(outputFilename);
 
-        _tcscpy_s(
-            errorMessage,
-            errorMessageCount,
-            _T("The GLB file could not be written completely."));
+        if (!MaxGLBOperationWasCancelled() &&
+            (errorMessage == NULL ||
+             errorMessage[0] == _T('\0')))
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The GLB file could not be written completely."));
+        }
+
         return FALSE;
     }
 
@@ -11821,7 +12667,7 @@ public:
 
     unsigned int Version()
     {
-        return 105;
+        return 108;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -11873,6 +12719,77 @@ public:
         TCHAR errorMessage[1024];
         errorMessage[0] = _T('\0');
 
+        g_exportProgressProcessedNodes = 0;
+
+        if (selectedOnly)
+        {
+            g_exportProgressTotalNodes =
+                maxInterface != NULL
+                ? maxInterface->GetSelNodeCount()
+                : 1;
+        }
+        else
+        {
+            g_exportProgressTotalNodes =
+                maxInterface != NULL
+                ? CountSceneNodesRecursive(
+                    maxInterface->GetRootNode())
+                : 1;
+        }
+
+        if (g_exportProgressTotalNodes <= 0)
+        {
+            g_exportProgressTotalNodes = 1;
+        }
+
+        BeginMaxGLBProgress(
+            suppressPrompts
+                ? NULL
+                : maxInterface,
+            _T("MaxGLB2016 Export"));
+
+        UpdateMaxGLBProgress(
+            1,
+            _T("Collecting scene objects..."));
+
+        TCHAR temporaryFilename[2048];
+        temporaryFilename[0] = _T('\0');
+
+        TCHAR actualOutputFilename[2048];
+        _tcscpy_s(
+            actualOutputFilename,
+            _countof(actualOutputFilename),
+            outputFilename);
+
+        BOOL usedAlternateOutputFilename =
+            FALSE;
+
+        DWORD outputReplacementError =
+            ERROR_SUCCESS;
+
+        if (!BuildTemporaryExportFilename(
+                outputFilename,
+                temporaryFilename,
+                _countof(temporaryFilename)))
+        {
+            EndMaxGLBProgress();
+
+            if (!suppressPrompts)
+            {
+                MessageBox(
+                    maxInterface != NULL
+                        ? maxInterface->GetMAXHWnd()
+                        : NULL,
+                    _T("The temporary export filename could not be created."),
+                    _T("MaxGLB2016 Export"),
+                    MB_OK | MB_ICONERROR);
+            }
+
+            return IMPEXP_FAIL;
+        }
+
+        DeleteFile(temporaryFilename);
+
         std::vector<MaxGLBExportMesh> meshes;
 
         if (!CollectMeshesForExport(
@@ -11888,12 +12805,35 @@ public:
                 errorMessage,
                 _countof(errorMessage)) ||
             !WriteGeometryGlbFile(
-                outputFilename,
+                temporaryFilename,
                 meshes,
                 selectedOnly,
                 errorMessage,
+                _countof(errorMessage)) ||
+            !UpdateMaxGLBProgress(
+                99,
+                _T("Finalizing output file...")) ||
+            !CommitTemporaryExportFile(
+                temporaryFilename,
+                outputFilename,
+                actualOutputFilename,
+                _countof(actualOutputFilename),
+                &usedAlternateOutputFilename,
+                &outputReplacementError,
+                errorMessage,
                 _countof(errorMessage)))
         {
+            const BOOL exportWasCancelled =
+                MaxGLBOperationWasCancelled();
+
+            DeleteFile(temporaryFilename);
+            EndMaxGLBProgress();
+
+            if (exportWasCancelled)
+            {
+                return IMPEXP_CANCEL;
+            }
+
             if (!suppressPrompts)
             {
                 MessageBox(
@@ -11907,6 +12847,12 @@ public:
 
             return IMPEXP_FAIL;
         }
+
+        UpdateMaxGLBProgress(
+            100,
+            _T("Export complete"));
+
+        EndMaxGLBProgress();
 
         size_t totalVertexCount = 0;
         size_t totalTriangleCount = 0;
@@ -12009,7 +12955,7 @@ public:
                 _T("- Max Z-up converted to glTF Y-up\n")
                 _T("- explicit normals and UV channel 1\n")
                 _T("- hard edges and UV seams preserved\n\n")
-                _T("Output:\n%s"),
+                _T("Output:\n%s%s"),
                 selectedOnly
                     ? _T("Export Selected")
                     : _T("Export Scene"),
@@ -12045,7 +12991,11 @@ public:
                 exportSettings.exportTextures
                     ? _T("yes")
                     : _T("no"),
-                outputFilename);
+                actualOutputFilename,
+                usedAlternateOutputFilename
+                    ? _T("\n\nNOTE: The requested file was open or locked.\n")
+                      _T("The completed export was saved under a new filename instead.")
+                    : _T(""));
 
             MessageBox(
                 maxInterface != NULL
@@ -12056,10 +13006,33 @@ public:
                 MB_OK | MB_ICONINFORMATION);
         }
 
+        if (!suppressPrompts &&
+            !exportSettings.showSummary &&
+            usedAlternateOutputFilename)
+        {
+            TCHAR alternateMessage[2300];
+
+            _stprintf_s(
+                alternateMessage,
+                _countof(alternateMessage),
+                _T("The requested GLB could not be replaced because it is open or locked.\n\n")
+                _T("The completed export was saved here instead:\n%s\n\n")
+                _T("Close the application using the original file before exporting over it."),
+                actualOutputFilename);
+
+            MessageBox(
+                maxInterface != NULL
+                    ? maxInterface->GetMAXHWnd()
+                    : NULL,
+                alternateMessage,
+                _T("MaxGLB2016 Export"),
+                MB_OK | MB_ICONWARNING);
+        }
+
         if (exportSettings.showInExplorer)
         {
             ShowExportedFileInExplorer(
-                outputFilename);
+                actualOutputFilename);
         }
 
         return IMPEXP_SUCCESS;

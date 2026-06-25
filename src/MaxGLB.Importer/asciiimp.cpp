@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <objbase.h>
 #include <wincodec.h>
 #include <uxtheme.h>
@@ -10,11 +10,13 @@
 #include <float.h>
 #include <math.h>
 #include <map>
+#include <set>
 #include <vector>
 #include <string>
 #include <sstream>
 #include <iomanip>
 #include <locale>
+#include <locale.h>
 
 #include "../../third_party/cgltf/cgltf.h"
 
@@ -24,6 +26,7 @@
 #include <stdmat.h>
 #include <iparamb2.h>
 #include <istdplug.h>
+#include <maxheapdirect.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -43,7 +46,10 @@ static std::map<const cgltf_image*, BOOL> g_unchangedImagesThisImport;
 
 struct MaxGLBImportSettings
 {
-    float rotationXDegrees;
+    // Row-major 3x3 rotation matrix applied after the official
+    // glTF Y-up -> 3ds Max Z-up conversion.
+    float rotationMatrix[9];
+
     BOOL importTextures;
     BOOL addParentNode;
     BOOL normalizeSize;
@@ -52,15 +58,34 @@ struct MaxGLBImportSettings
     BOOL importAnimation;
 
     MaxGLBImportSettings()
-        : rotationXDegrees(0.0f)
-        , importTextures(TRUE)
+        : importTextures(TRUE)
         , addParentNode(TRUE)
         , normalizeSize(FALSE)
         , normalizeTargetSize(1.0f)
         , appliedUniformScale(1.0f)
         , importAnimation(FALSE)
     {
+        rotationMatrix[0] = 1.0f;
+        rotationMatrix[1] = 0.0f;
+        rotationMatrix[2] = 0.0f;
+
+        rotationMatrix[3] = 0.0f;
+        rotationMatrix[4] = 1.0f;
+        rotationMatrix[5] = 0.0f;
+
+        rotationMatrix[6] = 0.0f;
+        rotationMatrix[7] = 0.0f;
+        rotationMatrix[8] = 1.0f;
     }
+};
+
+
+enum MaxGLBAlphaMode
+{
+    MAXGLB_ALPHA_AUTO = 0,
+    MAXGLB_ALPHA_OPAQUE = 1,
+    MAXGLB_ALPHA_MASK = 2,
+    MAXGLB_ALPHA_BLEND = 3
 };
 
 
@@ -74,6 +99,9 @@ struct MaxGLBExportSettings
     BOOL exportMaterials;
     BOOL exportTextures;
 
+    int alphaMode;
+    float alphaCutoff;
+
     BOOL showSummary;
     BOOL showInExplorer;
     BOOL exportAnimation;
@@ -85,6 +113,8 @@ struct MaxGLBExportSettings
         , appliedUniformScale(1.0f)
         , exportMaterials(TRUE)
         , exportTextures(TRUE)
+        , alphaMode(MAXGLB_ALPHA_AUTO)
+        , alphaCutoff(0.5f)
         , showSummary(TRUE)
         , showInExplorer(FALSE)
         , exportAnimation(FALSE)
@@ -138,6 +168,7 @@ static DWORD WINAPI MaxGLBProgressWorkerStub(
 
 static int g_exportProgressTotalNodes = 1;
 static int g_exportProgressProcessedNodes = 0;
+static int g_exportNextNodeGroupIndex = 0;
 
 
 static void BeginMaxGLBProgress(
@@ -322,6 +353,197 @@ static int CountSceneNodesRecursive(
 // Never change this after the public release.
 #define MAXGLB_EXPORTER_CLASS_ID \
     Class_ID(0x2b6f4d81, 0x71a35ce4)
+
+
+static const DWORD MAXGLB_ALPHA_METADATA_MAGIC =
+    0x414C5048u; // "ALPH"
+
+static const DWORD MAXGLB_ALPHA_METADATA_VERSION =
+    1u;
+
+static const DWORD MAXGLB_ALPHA_METADATA_SUB_ID =
+    0x4D474C42u; // "MGLB"
+
+static const DWORD MAXGLB_ALPHA_FLAG_OPACITY_FROM_BASE_ALPHA =
+    0x00000001u;
+
+
+struct MaxGLBAlphaMetadata
+{
+    DWORD magic;
+    DWORD version;
+    int mode;
+    float cutoff;
+    DWORD flags;
+};
+
+
+static float ClampMaxGLBAlphaCutoff(
+    float value)
+{
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+
+    return value;
+}
+
+
+static void StoreMaxGLBAlphaMetadata(
+    Mtl* material,
+    int alphaMode,
+    float alphaCutoff,
+    DWORD flags)
+{
+    if (material == NULL)
+    {
+        return;
+    }
+
+    material->RemoveAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_ALPHA_METADATA_SUB_ID);
+
+    MaxGLBAlphaMetadata* metadata =
+        static_cast<MaxGLBAlphaMetadata*>(
+            MAX_malloc(
+                sizeof(MaxGLBAlphaMetadata)));
+
+    if (metadata == NULL)
+    {
+        return;
+    }
+
+    metadata->magic =
+        MAXGLB_ALPHA_METADATA_MAGIC;
+
+    metadata->version =
+        MAXGLB_ALPHA_METADATA_VERSION;
+
+    metadata->mode =
+        alphaMode;
+
+    metadata->cutoff =
+        ClampMaxGLBAlphaCutoff(
+            alphaCutoff);
+
+    metadata->flags =
+        flags;
+
+    material->AddAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_ALPHA_METADATA_SUB_ID,
+        static_cast<DWORD>(
+            sizeof(MaxGLBAlphaMetadata)),
+        metadata);
+}
+
+
+static BOOL ReadMaxGLBAlphaMetadata(
+    Mtl* material,
+    int* outAlphaMode,
+    float* outAlphaCutoff,
+    DWORD* outFlags)
+{
+    if (outAlphaMode != NULL)
+    {
+        *outAlphaMode =
+            MAXGLB_ALPHA_OPAQUE;
+    }
+
+    if (outAlphaCutoff != NULL)
+    {
+        *outAlphaCutoff =
+            0.5f;
+    }
+
+    if (outFlags != NULL)
+    {
+        *outFlags = 0;
+    }
+
+    if (material == NULL)
+    {
+        return FALSE;
+    }
+
+    AppDataChunk* chunk =
+        material->GetAppDataChunk(
+            MAXGLB_IMPORTER_CLASS_ID,
+            MATERIAL_CLASS_ID,
+            MAXGLB_ALPHA_METADATA_SUB_ID);
+
+    if (chunk == NULL ||
+        chunk->data == NULL ||
+        chunk->length <
+            sizeof(MaxGLBAlphaMetadata))
+    {
+        return FALSE;
+    }
+
+    const MaxGLBAlphaMetadata* metadata =
+        static_cast<const MaxGLBAlphaMetadata*>(
+            chunk->data);
+
+    if (metadata->magic !=
+            MAXGLB_ALPHA_METADATA_MAGIC ||
+        metadata->version !=
+            MAXGLB_ALPHA_METADATA_VERSION ||
+        metadata->mode <
+            MAXGLB_ALPHA_OPAQUE ||
+        metadata->mode >
+            MAXGLB_ALPHA_BLEND)
+    {
+        return FALSE;
+    }
+
+    if (outAlphaMode != NULL)
+    {
+        *outAlphaMode =
+            metadata->mode;
+    }
+
+    if (outAlphaCutoff != NULL)
+    {
+        *outAlphaCutoff =
+            ClampMaxGLBAlphaCutoff(
+                metadata->cutoff);
+    }
+
+    if (outFlags != NULL)
+    {
+        *outFlags =
+            metadata->flags;
+    }
+
+    return TRUE;
+}
+
+
+static int ConvertCgltfAlphaMode(
+    cgltf_alpha_mode mode)
+{
+    if (mode == cgltf_alpha_mode_mask)
+    {
+        return MAXGLB_ALPHA_MASK;
+    }
+
+    if (mode == cgltf_alpha_mode_blend)
+    {
+        return MAXGLB_ALPHA_BLEND;
+    }
+
+    return MAXGLB_ALPHA_OPAQUE;
+}
+
 
 static void ShowImportMessage(
     HWND parentWindow,
@@ -566,19 +788,108 @@ static void BuildGltfWorldMatrix(
 }
 
 
-static Point3 RotateMaxSceneAroundX(
+static Point3 ApplyImportRotationMatrix(
     const Point3& point,
-    float degrees)
+    const float* matrix)
 {
-    if (fabsf(degrees) < 1.0e-6f)
+    if (matrix == NULL)
     {
         return point;
     }
 
+    return Point3(
+        matrix[0] * point.x +
+        matrix[1] * point.y +
+        matrix[2] * point.z,
+
+        matrix[3] * point.x +
+        matrix[4] * point.y +
+        matrix[5] * point.z,
+
+        matrix[6] * point.x +
+        matrix[7] * point.y +
+        matrix[8] * point.z);
+}
+
+
+static void MultiplyImportRotationMatrices(
+    const float* left,
+    const float* right,
+    float* output)
+{
+    if (left == NULL ||
+        right == NULL ||
+        output == NULL)
+    {
+        return;
+    }
+
+    float result[9];
+
+    for (int row = 0;
+         row < 3;
+         ++row)
+    {
+        for (int column = 0;
+             column < 3;
+             ++column)
+        {
+            result[row * 3 + column] =
+                left[row * 3 + 0] *
+                    right[0 * 3 + column] +
+                left[row * 3 + 1] *
+                    right[1 * 3 + column] +
+                left[row * 3 + 2] *
+                    right[2 * 3 + column];
+        }
+    }
+
+    for (int elementIndex = 0;
+         elementIndex < 9;
+         ++elementIndex)
+    {
+        output[elementIndex] =
+            result[elementIndex];
+    }
+}
+
+
+static void ResetImportRotationMatrix(
+    MaxGLBImportSettings* settings)
+{
+    if (settings == NULL)
+    {
+        return;
+    }
+
+    settings->rotationMatrix[0] = 1.0f;
+    settings->rotationMatrix[1] = 0.0f;
+    settings->rotationMatrix[2] = 0.0f;
+
+    settings->rotationMatrix[3] = 0.0f;
+    settings->rotationMatrix[4] = 1.0f;
+    settings->rotationMatrix[5] = 0.0f;
+
+    settings->rotationMatrix[6] = 0.0f;
+    settings->rotationMatrix[7] = 0.0f;
+    settings->rotationMatrix[8] = 1.0f;
+}
+
+
+static void ApplyImportQuarterTurn(
+    MaxGLBImportSettings* settings,
+    int axis,
+    int quarterTurns)
+{
+    if (settings == NULL)
+    {
+        return;
+    }
+
     const float radians =
-        degrees *
+        static_cast<float>(quarterTurns) *
         3.14159265358979323846f /
-        180.0f;
+        2.0f;
 
     const float cosine =
         cosf(radians);
@@ -586,29 +897,82 @@ static Point3 RotateMaxSceneAroundX(
     const float sine =
         sinf(radians);
 
-    return Point3(
-        point.x,
-        point.y * cosine - point.z * sine,
-        point.y * sine + point.z * cosine);
+    float turn[9] =
+    {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f
+    };
+
+    if (axis == 0)
+    {
+        // Max X: pitch up/down.
+        turn[4] = cosine;
+        turn[5] = -sine;
+        turn[7] = sine;
+        turn[8] = cosine;
+    }
+    else
+    {
+        // Max Z: turn left/right while retaining Z-up.
+        turn[0] = cosine;
+        turn[1] = -sine;
+        turn[3] = sine;
+        turn[4] = cosine;
+    }
+
+    // Pre-multiply: every click rotates the complete model around
+    // the visible Max-world axes.
+    MultiplyImportRotationMatrices(
+        turn,
+        settings->rotationMatrix,
+        settings->rotationMatrix);
 }
 
 
 static Point3 ConvertGltfPositionToMax(
     const cgltf_float* position,
-    float correctionXDegrees)
+    const float* correctionMatrix)
 {
-    // glTF is right-handed and Y-up. 3ds Max is Z-up. This standards-based
-    // coordinate conversion is always applied.
+    // Standards conversion: glTF is right-handed/Y-up, Max is Z-up.
     const Point3 maxPosition(
         static_cast<float>(position[0]),
         static_cast<float>(-position[2]),
         static_cast<float>(position[1]));
 
-    // The optional correction is deliberately separate. It is useful for
-    // files whose authoring workflow added or omitted an orientation helper.
-    return RotateMaxSceneAroundX(
+    return ApplyImportRotationMatrix(
         maxPosition,
-        correctionXDegrees);
+        correctionMatrix);
+}
+
+
+static Point3 ConvertGltfNormalToMax(
+    const cgltf_float* normal,
+    const float* correctionMatrix)
+{
+    Point3 maxNormal(
+        static_cast<float>(normal[0]),
+        static_cast<float>(-normal[2]),
+        static_cast<float>(normal[1]));
+
+    maxNormal =
+        ApplyImportRotationMatrix(
+            maxNormal,
+            correctionMatrix);
+
+    const float lengthSquared =
+        DotProd(
+            maxNormal,
+            maxNormal);
+
+    if (lengthSquared > 1.0e-20f)
+    {
+        maxNormal *=
+            1.0f /
+            sqrtf(lengthSquared);
+    }
+
+    return maxNormal;
 }
 
 
@@ -618,7 +982,7 @@ static Point3 ConvertGltfLocalPositionToMax(
     Point3 converted =
         ConvertGltfPositionToMax(
             position,
-            g_activeImportSettings.rotationXDegrees);
+            g_activeImportSettings.rotationMatrix);
 
     converted *=
         g_activeImportSettings.appliedUniformScale;
@@ -627,43 +991,12 @@ static Point3 ConvertGltfLocalPositionToMax(
 }
 
 
-static Point3 ConvertGltfNormalToMax(
-    const cgltf_float* normal,
-    float correctionXDegrees)
-{
-    Point3 maxNormal(
-        static_cast<float>(normal[0]),
-        static_cast<float>(-normal[2]),
-        static_cast<float>(normal[1]));
-
-    maxNormal =
-        RotateMaxSceneAroundX(
-            maxNormal,
-            correctionXDegrees);
-
-    const float lengthSquared =
-        maxNormal.x * maxNormal.x +
-        maxNormal.y * maxNormal.y +
-        maxNormal.z * maxNormal.z;
-
-    if (lengthSquared > 1.0e-20f)
-    {
-        const float inverseLength =
-            1.0f / sqrtf(lengthSquared);
-
-        maxNormal *= inverseLength;
-    }
-
-    return maxNormal;
-}
-
-
 static Point3 ConvertGltfLocalNormalToMax(
     const cgltf_float* normal)
 {
     return ConvertGltfNormalToMax(
         normal,
-        g_activeImportSettings.rotationXDegrees);
+        g_activeImportSettings.rotationMatrix);
 }
 
 
@@ -1536,6 +1869,290 @@ static BOOL WriteGrayPngWithWic(
 }
 
 
+static BOOL ExtractBaseColorAlphaTexture(
+    const cgltf_image* image,
+    const TCHAR* sourceFilename,
+    TCHAR* outputPath,
+    size_t outputPathCount,
+    BOOL* outHasTransparency,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (outHasTransparency != NULL)
+    {
+        *outHasTransparency =
+            FALSE;
+    }
+
+    const unsigned char* imageBytes = NULL;
+    size_t imageByteCount = 0;
+
+    if (!GetEmbeddedImageBytes(
+            image,
+            &imageBytes,
+            &imageByteCount,
+            errorMessage,
+            errorMessageCount))
+    {
+        return FALSE;
+    }
+
+    if (imageByteCount == 0 ||
+        imageByteCount >
+            static_cast<size_t>(UINT_MAX))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("The base-color image is empty or too large for alpha extraction."));
+        return FALSE;
+    }
+
+    const int imageIndex =
+        GetStableImportImageIndex(
+            image);
+
+    if (!BuildTexturePath(
+            sourceFilename,
+            _T("Opacity"),
+            imageIndex,
+            _T(".png"),
+            outputPath,
+            outputPathCount,
+            errorMessage,
+            errorMessageCount))
+    {
+        return FALSE;
+    }
+
+    HRESULT comResult =
+        CoInitializeEx(
+            NULL,
+            COINIT_APARTMENTTHREADED);
+
+    const BOOL shouldUninitialize =
+        SUCCEEDED(comResult);
+
+    if (FAILED(comResult) &&
+        comResult != RPC_E_CHANGED_MODE)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("COM could not be initialized for alpha extraction."));
+        return FALSE;
+    }
+
+    IWICImagingFactory* factory = NULL;
+    IWICStream* inputStream = NULL;
+    IWICBitmapDecoder* decoder = NULL;
+    IWICBitmapFrameDecode* sourceFrame = NULL;
+    IWICFormatConverter* converter = NULL;
+
+    HRESULT result =
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            NULL,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory));
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            factory->CreateStream(
+                &inputStream);
+    }
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            inputStream->InitializeFromMemory(
+                const_cast<BYTE*>(
+                    reinterpret_cast<const BYTE*>(
+                        imageBytes)),
+                static_cast<DWORD>(
+                    imageByteCount));
+    }
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            factory->CreateDecoderFromStream(
+                inputStream,
+                NULL,
+                WICDecodeMetadataCacheOnLoad,
+                &decoder);
+    }
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            decoder->GetFrame(
+                0,
+                &sourceFrame);
+    }
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            factory->CreateFormatConverter(
+                &converter);
+    }
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            converter->Initialize(
+                sourceFrame,
+                GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                NULL,
+                0.0,
+                WICBitmapPaletteTypeCustom);
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+
+    if (SUCCEEDED(result))
+    {
+        result =
+            converter->GetSize(
+                &width,
+                &height);
+    }
+
+    if (SUCCEEDED(result) &&
+        (width == 0 ||
+         height == 0 ||
+         width > UINT_MAX / 4 ||
+         height > UINT_MAX / (width * 4)))
+    {
+        result = E_FAIL;
+    }
+
+    std::vector<unsigned char> rgbaPixels;
+    std::vector<unsigned char> alphaPixels;
+    BOOL hasTransparency = FALSE;
+
+    if (SUCCEEDED(result))
+    {
+        const size_t pixelCount =
+            static_cast<size_t>(width) *
+            static_cast<size_t>(height);
+
+        rgbaPixels.resize(
+            pixelCount * 4);
+
+        alphaPixels.resize(
+            pixelCount);
+
+        result =
+            converter->CopyPixels(
+                NULL,
+                width * 4,
+                static_cast<UINT>(
+                    rgbaPixels.size()),
+                reinterpret_cast<BYTE*>(
+                    &rgbaPixels[0]));
+
+        if (SUCCEEDED(result))
+        {
+            for (size_t pixelIndex = 0;
+                 pixelIndex < pixelCount;
+                 ++pixelIndex)
+            {
+                const unsigned char alpha =
+                    rgbaPixels[
+                        pixelIndex * 4 + 3];
+
+                alphaPixels[pixelIndex] =
+                    alpha;
+
+                if (alpha < 255)
+                {
+                    hasTransparency =
+                        TRUE;
+                }
+            }
+        }
+    }
+
+    if (converter != NULL)
+    {
+        converter->Release();
+    }
+
+    if (sourceFrame != NULL)
+    {
+        sourceFrame->Release();
+    }
+
+    if (decoder != NULL)
+    {
+        decoder->Release();
+    }
+
+    if (inputStream != NULL)
+    {
+        inputStream->Release();
+    }
+
+    if (SUCCEEDED(result) &&
+        hasTransparency)
+    {
+        if (!WriteGrayPngWithWic(
+                factory,
+                outputPath,
+                width,
+                height,
+                alphaPixels,
+                errorMessage,
+                errorMessageCount))
+        {
+            result = E_FAIL;
+        }
+    }
+    else if (SUCCEEDED(result))
+    {
+        DeleteFile(
+            outputPath);
+    }
+
+    if (factory != NULL)
+    {
+        factory->Release();
+    }
+
+    if (shouldUninitialize)
+    {
+        CoUninitialize();
+    }
+
+    if (FAILED(result))
+    {
+        if (errorMessage[0] ==
+            _T('\0'))
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The base-color alpha channel could not be decoded."));
+        }
+
+        return FALSE;
+    }
+
+    if (outHasTransparency != NULL)
+    {
+        *outHasTransparency =
+            hasTransparency;
+    }
+
+    return TRUE;
+}
+
+
 static BOOL SplitOrmTexture(
     const cgltf_image* image,
     const TCHAR* sourceFilename,
@@ -2083,6 +2700,18 @@ static BOOL CreateStandardMaterialForPrimitive(
     Color baseColor(1.0f, 1.0f, 1.0f);
     float opacity = 1.0f;
 
+    const int importedAlphaMode =
+        ConvertCgltfAlphaMode(
+            gltfMaterial->alpha_mode);
+
+    const float importedAlphaCutoff =
+        importedAlphaMode ==
+            MAXGLB_ALPHA_MASK
+        ? ClampMaxGLBAlphaCutoff(
+            static_cast<float>(
+                gltfMaterial->alpha_cutoff))
+        : 0.5f;
+
     if (gltfMaterial->has_pbr_metallic_roughness)
     {
         const cgltf_pbr_metallic_roughness& pbr =
@@ -2109,8 +2738,12 @@ static BOOL CreateStandardMaterialForPrimitive(
         Color(1.0f, 1.0f, 1.0f),
         timeValue);
 
+    // OPAQUE ignores both base-color factor alpha and image alpha.
     maxMaterial->SetOpacity(
-        opacity,
+        importedAlphaMode ==
+            MAXGLB_ALPHA_OPAQUE
+        ? 1.0f
+        : opacity,
         timeValue);
 
     BOOL hasBaseColorTexture = FALSE;
@@ -2194,6 +2827,63 @@ static BOOL CreateStandardMaterialForPrimitive(
 
             hasBaseColorTexture = TRUE;
             AppendMaterialImportLog(_T("04: base color assigned"));
+
+            if (importedAlphaMode !=
+                    MAXGLB_ALPHA_OPAQUE)
+            {
+                TCHAR opacityPath[MAX_PATH];
+                BOOL hasTextureTransparency =
+                    FALSE;
+
+                if (!ExtractBaseColorAlphaTexture(
+                        baseColorView.texture->image,
+                        sourceFilename,
+                        opacityPath,
+                        _countof(opacityPath),
+                        &hasTextureTransparency,
+                        errorMessage,
+                        errorMessageCount))
+                {
+                    maxMaterial->DeleteThis();
+                    return FALSE;
+                }
+
+                if (hasTextureTransparency)
+                {
+                    BitmapTex* opacityBitmap =
+                        CreateBitmapTexture(
+                            _T("MaxGLB2016_Opacity_0"),
+                            opacityPath);
+
+                    if (opacityBitmap == NULL ||
+                        !AssignStdMaterialMap(
+                            maxMaterial,
+                            ID_OP,
+                            opacityBitmap,
+                            1.0f,
+                            timeValue))
+                    {
+                        if (opacityBitmap != NULL)
+                        {
+                            opacityBitmap->DeleteThis();
+                        }
+
+                        maxMaterial->DeleteThis();
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("The base-color alpha channel could not be assigned to the opacity slot."));
+                        return FALSE;
+                    }
+
+                    StoreMaxGLBAlphaMetadata(
+                        maxMaterial,
+                        importedAlphaMode,
+                        importedAlphaCutoff,
+                        MAXGLB_ALPHA_FLAG_OPACITY_FROM_BASE_ALPHA);
+                }
+            }
         }
     }
 
@@ -2437,6 +3127,26 @@ static BOOL CreateStandardMaterialForPrimitive(
 
     }
 
+    int existingAlphaMode =
+        MAXGLB_ALPHA_OPAQUE;
+
+    float existingAlphaCutoff =
+        0.5f;
+
+    DWORD existingAlphaFlags = 0;
+
+    ReadMaxGLBAlphaMetadata(
+        maxMaterial,
+        &existingAlphaMode,
+        &existingAlphaCutoff,
+        &existingAlphaFlags);
+
+    StoreMaxGLBAlphaMetadata(
+        maxMaterial,
+        importedAlphaMode,
+        importedAlphaCutoff,
+        existingAlphaFlags);
+
     AppendMaterialImportLog(_T("10: material graph complete"));
 
     maxMaterial->NotifyDependents(
@@ -2557,8 +3267,6 @@ static void ConvertUtf8ToTchar(
 
 
 
-#define MAXGLB_ID_ROTATION_COMBO       4101
-#define MAXGLB_ID_CUSTOM_ROTATION      4102
 #define MAXGLB_ID_IMPORT_TEXTURES      4103
 #define MAXGLB_ID_ADD_PARENT           4104
 #define MAXGLB_ID_IMPORT_ANIMATION     4105
@@ -2570,6 +3278,11 @@ static void ConvertUtf8ToTchar(
 #define MAXGLB_ID_TEXTURE_LIST         4111
 #define MAXGLB_ID_NORMALIZE_SIZE       4112
 #define MAXGLB_ID_NORMALIZE_TARGET     4113
+#define MAXGLB_ID_PREVIEW_ROTATE_UP    4114
+#define MAXGLB_ID_PREVIEW_ROTATE_DOWN  4115
+#define MAXGLB_ID_PREVIEW_ROTATE_LEFT  4116
+#define MAXGLB_ID_PREVIEW_ROTATE_RIGHT 4117
+#define MAXGLB_ID_PREVIEW_ROTATE_RESET 4118
 
 
 #define MAXGLB_ID_EXPORT_SCALE             4201
@@ -2583,6 +3296,8 @@ static void ConvertUtf8ToTchar(
 #define MAXGLB_ID_EXPORT_INFO              4209
 #define MAXGLB_ID_EXPORT_CANCEL            4210
 #define MAXGLB_ID_EXPORT_CONFIRM           4211
+#define MAXGLB_ID_EXPORT_ALPHA_MODE        4212
+#define MAXGLB_ID_EXPORT_ALPHA_CUTOFF      4213
 
 
 struct MaxGLBImportDialogContext
@@ -2590,8 +3305,11 @@ struct MaxGLBImportDialogContext
     HWND parentWindow;
     HWND window;
     HWND previewWindow;
-    HWND rotationCombo;
-    HWND customRotationEdit;
+    HWND previewRotateUpButton;
+    HWND previewRotateDownButton;
+    HWND previewRotateLeftButton;
+    HWND previewRotateRightButton;
+    HWND previewRotateResetButton;
     HWND importTexturesCheck;
     HWND addParentCheck;
     HWND normalizeSizeCheck;
@@ -2613,8 +3331,11 @@ struct MaxGLBImportDialogContext
         : parentWindow(NULL)
         , window(NULL)
         , previewWindow(NULL)
-        , rotationCombo(NULL)
-        , customRotationEdit(NULL)
+        , previewRotateUpButton(NULL)
+        , previewRotateDownButton(NULL)
+        , previewRotateLeftButton(NULL)
+        , previewRotateRightButton(NULL)
+        , previewRotateResetButton(NULL)
         , importTexturesCheck(NULL)
         , addParentCheck(NULL)
         , normalizeSizeCheck(NULL)
@@ -2699,7 +3420,12 @@ static BOOL IsImportPushButtonId(
 {
     return controlId == MAXGLB_ID_INFO ||
         controlId == MAXGLB_ID_CANCEL ||
-        controlId == MAXGLB_ID_IMPORT;
+        controlId == MAXGLB_ID_IMPORT ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_UP ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_DOWN ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_LEFT ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_RIGHT ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_RESET;
 }
 
 
@@ -2973,6 +3699,101 @@ static void DrawLightImportPushButton(
 
     DeleteObject(borderPen);
 
+    const BOOL isArrowButton =
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_UP ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_DOWN ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_LEFT ||
+        controlId == MAXGLB_ID_PREVIEW_ROTATE_RIGHT;
+
+    if (isArrowButton)
+    {
+        const int offset =
+            pressed ? 1 : 0;
+
+        const int centerX =
+            (itemRect.left + itemRect.right) / 2 +
+            offset;
+
+        const int centerY =
+            (itemRect.top + itemRect.bottom) / 2 +
+            offset;
+
+        HPEN arrowPen =
+            CreatePen(
+                PS_SOLID,
+                2,
+                disabled
+                    ? GetSysColor(COLOR_GRAYTEXT)
+                    : RGB(20, 20, 20));
+
+        HPEN oldArrowPen =
+            reinterpret_cast<HPEN>(
+                SelectObject(
+                    deviceContext,
+                    arrowPen));
+
+        if (controlId == MAXGLB_ID_PREVIEW_ROTATE_UP)
+        {
+            MoveToEx(deviceContext, centerX, centerY + 7, NULL);
+            LineTo(deviceContext, centerX, centerY - 7);
+            LineTo(deviceContext, centerX - 5, centerY - 2);
+
+            MoveToEx(deviceContext, centerX, centerY - 7, NULL);
+            LineTo(deviceContext, centerX + 5, centerY - 2);
+        }
+        else if (controlId == MAXGLB_ID_PREVIEW_ROTATE_DOWN)
+        {
+            MoveToEx(deviceContext, centerX, centerY - 7, NULL);
+            LineTo(deviceContext, centerX, centerY + 7);
+            LineTo(deviceContext, centerX - 5, centerY + 2);
+
+            MoveToEx(deviceContext, centerX, centerY + 7, NULL);
+            LineTo(deviceContext, centerX + 5, centerY + 2);
+        }
+        else if (controlId == MAXGLB_ID_PREVIEW_ROTATE_LEFT)
+        {
+            MoveToEx(deviceContext, centerX + 7, centerY, NULL);
+            LineTo(deviceContext, centerX - 7, centerY);
+            LineTo(deviceContext, centerX - 2, centerY - 5);
+
+            MoveToEx(deviceContext, centerX - 7, centerY, NULL);
+            LineTo(deviceContext, centerX - 2, centerY + 5);
+        }
+        else
+        {
+            MoveToEx(deviceContext, centerX - 7, centerY, NULL);
+            LineTo(deviceContext, centerX + 7, centerY);
+            LineTo(deviceContext, centerX + 2, centerY - 5);
+
+            MoveToEx(deviceContext, centerX + 7, centerY, NULL);
+            LineTo(deviceContext, centerX + 2, centerY + 5);
+        }
+
+        SelectObject(
+            deviceContext,
+            oldArrowPen);
+
+        DeleteObject(arrowPen);
+
+        if (focused &&
+            !disabled)
+        {
+            RECT focusRect =
+                itemRect;
+
+            InflateRect(
+                &focusRect,
+                -4,
+                -4);
+
+            DrawFocusRect(
+                deviceContext,
+                &focusRect);
+        }
+
+        return;
+    }
+
     TCHAR caption[128];
     caption[0] = _T('\0');
 
@@ -3170,6 +3991,119 @@ static int CountImportableScenePrimitives(
             {
                 count +=
                     CountImportablePrimitivesRecursive(
+                        node);
+            }
+        }
+    }
+
+    return count;
+}
+
+
+static int CountImportableMeshNodesRecursive(
+    const cgltf_node* node)
+{
+    if (node == NULL)
+    {
+        return 0;
+    }
+
+    int count = 0;
+
+    if (node->mesh != NULL)
+    {
+        BOOL hasImportablePrimitive = FALSE;
+
+        for (cgltf_size primitiveIndex = 0;
+             primitiveIndex < node->mesh->primitives_count;
+             ++primitiveIndex)
+        {
+            const cgltf_primitive* primitive =
+                &node->mesh->primitives[primitiveIndex];
+
+            const cgltf_accessor* positions =
+                cgltf_find_accessor(
+                    primitive,
+                    cgltf_attribute_type_position,
+                    0);
+
+            if (primitive->type ==
+                    cgltf_primitive_type_triangles &&
+                positions != NULL &&
+                positions->type ==
+                    cgltf_type_vec3 &&
+                positions->count > 0)
+            {
+                hasImportablePrimitive =
+                    TRUE;
+                break;
+            }
+        }
+
+        if (hasImportablePrimitive)
+        {
+            ++count;
+        }
+    }
+
+    for (cgltf_size childIndex = 0;
+         childIndex < node->children_count;
+         ++childIndex)
+    {
+        count +=
+            CountImportableMeshNodesRecursive(
+                node->children[childIndex]);
+    }
+
+    return count;
+}
+
+
+static int CountImportableSceneMeshNodes(
+    const cgltf_data* data)
+{
+    if (data == NULL)
+    {
+        return 0;
+    }
+
+    int count = 0;
+
+    const cgltf_scene* activeScene =
+        data->scene;
+
+    if (activeScene == NULL &&
+        data->scenes_count > 0)
+    {
+        activeScene =
+            &data->scenes[0];
+    }
+
+    if (activeScene != NULL &&
+        activeScene->nodes_count > 0)
+    {
+        for (cgltf_size rootIndex = 0;
+             rootIndex < activeScene->nodes_count;
+             ++rootIndex)
+        {
+            count +=
+                CountImportableMeshNodesRecursive(
+                    activeScene->nodes[rootIndex]);
+        }
+    }
+    else
+    {
+        for (cgltf_size nodeIndex = 0;
+             nodeIndex < data->nodes_count;
+             ++nodeIndex)
+        {
+            const cgltf_node* node =
+                &data->nodes[nodeIndex];
+
+            if (FindParentNode(data, node) == NULL)
+            {
+                count +=
+                    CountImportableMeshNodesRecursive(
                         node);
             }
         }
@@ -3527,7 +4461,7 @@ static void CollectPreviewPointsFromNode(
                 outputPoints.push_back(
                     ConvertGltfPositionToMax(
                         worldPosition,
-                        0.0f));
+                        NULL));
             }
         }
     }
@@ -3611,7 +4545,7 @@ static void CollectScenePreviewPoints(
 static void ExpandImportBoundsFromNode(
     const cgltf_data* data,
     const cgltf_node* node,
-    float correctionXDegrees,
+    const float* correctionMatrix,
     Point3* minimum,
     Point3* maximum,
     BOOL* hasBounds)
@@ -3684,7 +4618,7 @@ static void ExpandImportBoundsFromNode(
                 const Point3 converted =
                     ConvertGltfPositionToMax(
                         worldPosition,
-                        correctionXDegrees);
+                        correctionMatrix);
 
                 if (!*hasBounds)
                 {
@@ -3735,7 +4669,7 @@ static void ExpandImportBoundsFromNode(
         ExpandImportBoundsFromNode(
             data,
             node->children[childIndex],
-            correctionXDegrees,
+            correctionMatrix,
             minimum,
             maximum,
             hasBounds);
@@ -3745,7 +4679,7 @@ static void ExpandImportBoundsFromNode(
 
 static BOOL ComputeNormalizedImportScale(
     const cgltf_data* data,
-    float correctionXDegrees,
+    const float* correctionMatrix,
     float targetSize,
     float* outputScale)
 {
@@ -3780,7 +4714,7 @@ static BOOL ComputeNormalizedImportScale(
             ExpandImportBoundsFromNode(
                 data,
                 activeScene->nodes[rootIndex],
-                correctionXDegrees,
+                correctionMatrix,
                 &minimum,
                 &maximum,
                 &hasBounds);
@@ -3800,7 +4734,7 @@ static BOOL ComputeNormalizedImportScale(
                 ExpandImportBoundsFromNode(
                     data,
                     node,
-                    correctionXDegrees,
+                    correctionMatrix,
                     &minimum,
                     &maximum,
                     &hasBounds);
@@ -3912,9 +4846,9 @@ static void DrawImportPreview(
          ++pointIndex)
     {
         const Point3 corrected =
-            RotateMaxSceneAroundX(
+            ApplyImportRotationMatrix(
                 context->previewPoints[pointIndex],
-                context->settings.rotationXDegrees);
+                context->settings.rotationMatrix);
 
         // True 3ds Max Front view: X runs horizontally and Z vertically.
         // We look along the negative Y axis. This makes "up" unambiguous
@@ -4151,11 +5085,10 @@ static void DrawImportPreview(
         DT_SINGLELINE);
 
     TCHAR rotationText[96];
-    _stprintf_s(
+    _tcscpy_s(
         rotationText,
         _countof(rotationText),
-        _T("Front X/Z  |  X correction: %.1f deg"),
-        context->settings.rotationXDegrees);
+        _T("Front X/Z  |  arrows rotate import"));
 
     RECT textRect = clientRect;
     textRect.top =
@@ -4241,51 +5174,40 @@ static LRESULT CALLBACK MaxGLBPreviewWindowProcedure(
 }
 
 
-static BOOL TryReadCustomRotation(
+static BOOL TryReadUnitFloat(
     HWND editControl,
-    float* outputDegrees)
+    float* outputValue)
 {
     if (editControl == NULL ||
-        outputDegrees == NULL)
+        outputValue == NULL)
     {
         return FALSE;
     }
 
-    TCHAR text[64];
+    TCHAR textValue[64];
+
     GetWindowText(
         editControl,
-        text,
-        _countof(text));
+        textValue,
+        _countof(textValue));
 
     TCHAR* endPointer = NULL;
+
     const double parsedValue =
         _tcstod(
-            text,
+            textValue,
             &endPointer);
 
-    if (endPointer == text)
+    if (endPointer == textValue ||
+        parsedValue < 0.0 ||
+        parsedValue > 1.0)
     {
         return FALSE;
     }
 
-    while (endPointer != NULL &&
-           (*endPointer == _T(' ') ||
-            *endPointer == _T('\t')))
-    {
-        ++endPointer;
-    }
-
-    if (endPointer == NULL ||
-        *endPointer != _T('\0') ||
-        parsedValue != parsedValue ||
-        parsedValue < -36000.0 ||
-        parsedValue > 36000.0)
-    {
-        return FALSE;
-    }
-
-    *outputDegrees =
-        static_cast<float>(parsedValue);
+    *outputValue =
+        static_cast<float>(
+            parsedValue);
 
     return TRUE;
 }
@@ -4338,116 +5260,6 @@ static BOOL TryReadPositiveImportSize(
         static_cast<float>(parsedValue);
 
     return TRUE;
-}
-
-
-static void UpdateRotationFromControls(
-    MaxGLBImportDialogContext* context,
-    BOOL validateCustomValue)
-{
-    if (context == NULL ||
-        context->rotationCombo == NULL)
-    {
-        return;
-    }
-
-    const int selectedIndex =
-        static_cast<int>(
-            SendMessage(
-                context->rotationCombo,
-                CB_GETCURSEL,
-                0,
-                0));
-
-    BOOL customRotation = FALSE;
-
-    switch (selectedIndex)
-    {
-    case 1:
-        context->settings.rotationXDegrees =
-            90.0f;
-        break;
-
-    case 2:
-        context->settings.rotationXDegrees =
-            -90.0f;
-        break;
-
-    case 3:
-        context->settings.rotationXDegrees =
-            180.0f;
-        break;
-
-    case 4:
-        customRotation = TRUE;
-        {
-            float customDegrees =
-                context->settings.rotationXDegrees;
-
-            if (TryReadCustomRotation(
-                    context->customRotationEdit,
-                    &customDegrees))
-            {
-                context->settings.rotationXDegrees =
-                    customDegrees;
-            }
-            else if (validateCustomValue)
-            {
-                MessageBox(
-                    context->window,
-                    _T("Please enter a valid custom X rotation in degrees."),
-                    _T("MaxGLB2016"),
-                    MB_OK |
-                    MB_ICONWARNING);
-            }
-        }
-        break;
-
-    case 0:
-    default:
-        context->settings.rotationXDegrees =
-            0.0f;
-        break;
-    }
-
-    EnableWindow(
-        context->customRotationEdit,
-        customRotation);
-
-    if (context->previewWindow != NULL)
-    {
-        InvalidateRect(
-            context->previewWindow,
-            NULL,
-            FALSE);
-    }
-}
-
-
-static int RotationComboIndexForSettings(
-    const MaxGLBImportSettings& settings)
-{
-    if (fabsf(settings.rotationXDegrees) < 0.001f)
-    {
-        return 0;
-    }
-
-    if (fabsf(settings.rotationXDegrees - 90.0f) < 0.001f)
-    {
-        return 1;
-    }
-
-    if (fabsf(settings.rotationXDegrees + 90.0f) < 0.001f)
-    {
-        return 2;
-    }
-
-    if (fabsf(fabsf(settings.rotationXDegrees) - 180.0f) < 0.001f)
-    {
-        return 3;
-    }
-
-    return 4;
 }
 
 
@@ -4586,6 +5398,106 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     0,
                     context);
 
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Import rotation"),
+                WS_CHILD |
+                WS_VISIBLE |
+                SS_CENTER,
+                24,
+                194,
+                134,
+                18,
+                window,
+                0,
+                NULL);
+
+            context->previewRotateUpButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    69,
+                    214,
+                    30,
+                    25,
+                    window,
+                    MAXGLB_ID_PREVIEW_ROTATE_UP,
+                    NULL);
+
+            context->previewRotateLeftButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    34,
+                    243,
+                    30,
+                    25,
+                    window,
+                    MAXGLB_ID_PREVIEW_ROTATE_LEFT,
+                    NULL);
+
+            context->previewRotateResetButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("0"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    69,
+                    243,
+                    30,
+                    25,
+                    window,
+                    MAXGLB_ID_PREVIEW_ROTATE_RESET,
+                    NULL);
+
+            context->previewRotateRightButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    104,
+                    243,
+                    30,
+                    25,
+                    window,
+                    MAXGLB_ID_PREVIEW_ROTATE_RIGHT,
+                    NULL);
+
+            context->previewRotateDownButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    69,
+                    272,
+                    30,
+                    25,
+                    window,
+                    MAXGLB_ID_PREVIEW_ROTATE_DOWN,
+                    NULL);
+
             TCHAR summaryText[512];
             _stprintf_s(
                 summaryText,
@@ -4616,9 +5528,9 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 WS_VISIBLE |
                 SS_LEFT,
                 16,
-                200,
+                307,
                 150,
-                105,
+                100,
                 window,
                 0,
                 NULL);
@@ -4732,117 +5644,14 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
             CreateImportControl(
                 0,
                 _T("STATIC"),
-                _T("X rotation correction:"),
+                _T("The arrows rotate the actual import in 90-degree steps. The center 0 resets it."),
                 WS_CHILD |
-                WS_VISIBLE,
+                WS_VISIBLE |
+                SS_LEFT,
                 180,
-                245,
-                135,
-                22,
-                window,
-                0,
-                NULL);
-
-            context->rotationCombo =
-                CreateImportControl(
-                    WS_EX_CLIENTEDGE,
-                    _T("COMBOBOX"),
-                    _T(""),
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    WS_TABSTOP |
-                    CBS_DROPDOWNLIST |
-                    WS_VSCROLL,
-                    315,
-                    240,
-                    185,
-                    160,
-                    window,
-                    MAXGLB_ID_ROTATION_COMBO,
-                    NULL);
-
-            SendMessage(
-                context->rotationCombo,
-                CB_ADDSTRING,
-                0,
-                reinterpret_cast<LPARAM>(
-                    _T("Auto / standard glTF (0 deg)")));
-
-            SendMessage(
-                context->rotationCombo,
-                CB_ADDSTRING,
-                0,
-                reinterpret_cast<LPARAM>(
-                    _T("Rotate +90 deg around X")));
-
-            SendMessage(
-                context->rotationCombo,
-                CB_ADDSTRING,
-                0,
-                reinterpret_cast<LPARAM>(
-                    _T("Rotate -90 deg around X")));
-
-            SendMessage(
-                context->rotationCombo,
-                CB_ADDSTRING,
-                0,
-                reinterpret_cast<LPARAM>(
-                    _T("Rotate 180 deg around X")));
-
-            SendMessage(
-                context->rotationCombo,
-                CB_ADDSTRING,
-                0,
-                reinterpret_cast<LPARAM>(
-                    _T("Custom angle")));
-
-            const int rotationIndex =
-                RotationComboIndexForSettings(
-                    context->settings);
-
-            SendMessage(
-                context->rotationCombo,
-                CB_SETCURSEL,
-                rotationIndex,
-                0);
-
-            TCHAR customRotationText[64];
-            _stprintf_s(
-                customRotationText,
-                _countof(customRotationText),
-                _T("%.3f"),
-                context->settings.rotationXDegrees);
-
-            context->customRotationEdit =
-                CreateImportControl(
-                    WS_EX_CLIENTEDGE,
-                    _T("EDIT"),
-                    customRotationText,
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    WS_TABSTOP |
-                    ES_AUTOHSCROLL,
-                    510,
-                    240,
-                    80,
-                    24,
-                    window,
-                    MAXGLB_ID_CUSTOM_ROTATION,
-                    NULL);
-
-            UseReadableClassicTheme(
-                context->customRotationEdit);
-
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("degrees"),
-                WS_CHILD |
-                WS_VISIBLE,
-                596,
-                245,
-                60,
-                20,
+                240,
+                470,
+                28,
                 window,
                 0,
                 NULL);
@@ -5077,10 +5886,6 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 MAXGLB_ID_IMPORT,
                 0);
 
-            UpdateRotationFromControls(
-                context,
-                FALSE);
-
             SetFocus(importButton);
         }
         return 0;
@@ -5096,10 +5901,8 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     longParameter);
 
             if (context != NULL &&
-                (controlWindow ==
-                    context->customRotationEdit ||
-                 controlWindow ==
-                    context->normalizeTargetEdit))
+                controlWindow ==
+                    context->normalizeTargetEdit)
             {
                 if (IsWindowEnabled(controlWindow))
                 {
@@ -5147,10 +5950,8 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
 
             // A disabled edit control is reported through WM_CTLCOLORSTATIC.
             if (context != NULL &&
-                (controlWindow ==
-                    context->customRotationEdit ||
-                 controlWindow ==
-                    context->normalizeTargetEdit))
+                controlWindow ==
+                    context->normalizeTargetEdit)
             {
                 SetTextColor(
                     controlDc,
@@ -5291,33 +6092,91 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                 return 0;
             }
 
-            if (controlId == MAXGLB_ID_ROTATION_COMBO &&
-                notificationCode == CBN_SELCHANGE)
+            if (controlId == MAXGLB_ID_PREVIEW_ROTATE_UP &&
+                notificationCode == BN_CLICKED)
             {
-                UpdateRotationFromControls(
-                    context,
-                    FALSE);
+                ApplyImportQuarterTurn(
+                    &context->settings,
+                    0,
+                    -1);
+
+                InvalidateRect(
+                    context->previewWindow,
+                    NULL,
+                    TRUE);
+
+                UpdateWindow(
+                    context->previewWindow);
                 return 0;
             }
 
-            if (controlId == MAXGLB_ID_CUSTOM_ROTATION &&
-                notificationCode == EN_CHANGE)
+            if (controlId == MAXGLB_ID_PREVIEW_ROTATE_DOWN &&
+                notificationCode == BN_CLICKED)
             {
-                const int selectedIndex =
-                    static_cast<int>(
-                        SendMessage(
-                            context->rotationCombo,
-                            CB_GETCURSEL,
-                            0,
-                            0));
+                ApplyImportQuarterTurn(
+                    &context->settings,
+                    0,
+                    1);
 
-                if (selectedIndex == 4)
-                {
-                    UpdateRotationFromControls(
-                        context,
-                        FALSE);
-                }
+                InvalidateRect(
+                    context->previewWindow,
+                    NULL,
+                    TRUE);
 
+                UpdateWindow(
+                    context->previewWindow);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_PREVIEW_ROTATE_LEFT &&
+                notificationCode == BN_CLICKED)
+            {
+                ApplyImportQuarterTurn(
+                    &context->settings,
+                    2,
+                    1);
+
+                InvalidateRect(
+                    context->previewWindow,
+                    NULL,
+                    TRUE);
+
+                UpdateWindow(
+                    context->previewWindow);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_PREVIEW_ROTATE_RESET &&
+                notificationCode == BN_CLICKED)
+            {
+                ResetImportRotationMatrix(
+                    &context->settings);
+
+                InvalidateRect(
+                    context->previewWindow,
+                    NULL,
+                    TRUE);
+
+                UpdateWindow(
+                    context->previewWindow);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_PREVIEW_ROTATE_RIGHT &&
+                notificationCode == BN_CLICKED)
+            {
+                ApplyImportQuarterTurn(
+                    &context->settings,
+                    2,
+                    -1);
+
+                InvalidateRect(
+                    context->previewWindow,
+                    NULL,
+                    TRUE);
+
+                UpdateWindow(
+                    context->previewWindow);
                 return 0;
             }
 
@@ -5327,7 +6186,7 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
                     window,
                     _T("MaxGLB2016 imports static triangle meshes for editing and optimization in 3ds Max 2016.\n\n")
                     _T("The preview uses the 3ds Max Front view: X is horizontal, Z+ points upward, and the camera looks along -Y.\n\n")
-                    _T("Auto rotation performs only the official glTF Y-up to Max Z-up conversion. The additional X angle is a user correction.\n\n")
+                    _T("The four arrow buttons rotate both the preview and the final imported model in exact 90-degree steps. Up/down rotate around Max X; left/right rotate around Max Z. The center 0 button restores the standard orientation.\n\n")
                     _T("When Add parent node is enabled, all created mesh nodes are attached below a Dummy helper named Root:NAME.\n\n")
                     _T("Normalize size scales the complete imported model uniformly so its largest world-space dimension equals the entered Max-unit value.\n\n")
                     _T("Animation is intentionally outside the current static-model workflow."),
@@ -5348,41 +6207,6 @@ static LRESULT CALLBACK MaxGLBImportWindowProcedure(
             if (controlId == MAXGLB_ID_IMPORT ||
                 controlId == IDOK)
             {
-                const int selectedIndex =
-                    static_cast<int>(
-                        SendMessage(
-                            context->rotationCombo,
-                            CB_GETCURSEL,
-                            0,
-                            0));
-
-                if (selectedIndex == 4)
-                {
-                    float customDegrees = 0.0f;
-
-                    if (!TryReadCustomRotation(
-                            context->customRotationEdit,
-                            &customDegrees))
-                    {
-                        MessageBox(
-                            window,
-                            _T("Please enter a valid custom X rotation in degrees."),
-                            _T("MaxGLB2016"),
-                            MB_OK |
-                            MB_ICONWARNING);
-                        return 0;
-                    }
-
-                    context->settings.rotationXDegrees =
-                        customDegrees;
-                }
-                else
-                {
-                    UpdateRotationFromControls(
-                        context,
-                        TRUE);
-                }
-
                 context->settings.importTextures =
                     GetImportCheckboxState(
                         context->importTexturesCheck);
@@ -5562,7 +6386,7 @@ static BOOL ShowMaxGLBImportOptions(
         *settings;
 
     context.importableObjectCount =
-        CountImportableScenePrimitives(data);
+        CountImportableSceneMeshNodes(data);
 
     CollectScenePreviewPoints(
         data,
@@ -5750,6 +6574,8 @@ struct MaxGLBExportDialogContext
     HWND normalizeTargetEdit;
     HWND materialsCheck;
     HWND texturesCheck;
+    HWND alphaModeCombo;
+    HWND alphaCutoffEdit;
     HWND summaryCheck;
     HWND explorerCheck;
     HWND animationCheck;
@@ -5770,6 +6596,8 @@ struct MaxGLBExportDialogContext
         , normalizeTargetEdit(NULL)
         , materialsCheck(NULL)
         , texturesCheck(NULL)
+        , alphaModeCombo(NULL)
+        , alphaCutoffEdit(NULL)
         , summaryCheck(NULL)
         , explorerCheck(NULL)
         , animationCheck(NULL)
@@ -5831,6 +6659,26 @@ static void UpdateExportDialogEnabledState(
         context->texturesCheck,
         materialsEnabled);
 
+    EnableWindow(
+        context->alphaModeCombo,
+        materialsEnabled);
+
+    const int selectedAlphaMode =
+        context->alphaModeCombo != NULL
+        ? static_cast<int>(
+            SendMessage(
+                context->alphaModeCombo,
+                CB_GETCURSEL,
+                0,
+                0))
+        : MAXGLB_ALPHA_AUTO;
+
+    EnableWindow(
+        context->alphaCutoffEdit,
+        materialsEnabled &&
+        selectedAlphaMode ==
+            MAXGLB_ALPHA_MASK);
+
     InvalidateRect(
         context->scaleEdit,
         NULL,
@@ -5843,6 +6691,11 @@ static void UpdateExportDialogEnabledState(
 
     InvalidateRect(
         context->texturesCheck,
+        NULL,
+        TRUE);
+
+    InvalidateRect(
+        context->alphaCutoffEdit,
         NULL,
         TRUE);
 }
@@ -6125,6 +6978,114 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
             CreateImportControl(
                 0,
                 _T("STATIC"),
+                _T("Alpha mode"),
+                WS_CHILD |
+                WS_VISIBLE,
+                315,
+                176,
+                190,
+                20,
+                window,
+                -1,
+                NULL);
+
+            context->alphaModeCombo =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("COMBOBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    CBS_DROPDOWNLIST |
+                    WS_VSCROLL,
+                    315,
+                    202,
+                    200,
+                    120,
+                    window,
+                    MAXGLB_ID_EXPORT_ALPHA_MODE,
+                    NULL);
+
+            SendMessage(
+                context->alphaModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Auto / preserve")));
+
+            SendMessage(
+                context->alphaModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("OPAQUE")));
+
+            SendMessage(
+                context->alphaModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("MASK")));
+
+            SendMessage(
+                context->alphaModeCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("BLEND")));
+
+            SendMessage(
+                context->alphaModeCombo,
+                CB_SETCURSEL,
+                context->settings.alphaMode,
+                0);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Mask cutoff"),
+                WS_CHILD |
+                WS_VISIBLE,
+                315,
+                234,
+                90,
+                20,
+                window,
+                -1,
+                NULL);
+
+            TCHAR alphaCutoffText[64];
+
+            _stprintf_s(
+                alphaCutoffText,
+                _countof(alphaCutoffText),
+                _T("%.4g"),
+                context->settings.alphaCutoff);
+
+            context->alphaCutoffEdit =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("EDIT"),
+                    alphaCutoffText,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    ES_AUTOHSCROLL,
+                    410,
+                    231,
+                    80,
+                    24,
+                    window,
+                    MAXGLB_ID_EXPORT_ALPHA_CUTOFF,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->alphaCutoffEdit);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
                 _T("Geometry is always triangulated; modifier stacks, transforms, normals and UV channel 1 are exported automatically."),
                 WS_CHILD |
                 WS_VISIBLE,
@@ -6287,7 +7248,8 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
 
             if (context != NULL &&
                 (controlWindow == context->scaleEdit ||
-                 controlWindow == context->normalizeTargetEdit))
+                 controlWindow == context->normalizeTargetEdit ||
+                 controlWindow == context->alphaCutoffEdit))
             {
                 if (IsWindowEnabled(controlWindow))
                 {
@@ -6329,7 +7291,8 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
 
             if (context != NULL &&
                 (controlWindow == context->scaleEdit ||
-                 controlWindow == context->normalizeTargetEdit))
+                 controlWindow == context->normalizeTargetEdit ||
+                 controlWindow == context->alphaCutoffEdit))
             {
                 SetTextColor(
                     controlDc,
@@ -6414,6 +7377,14 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 return 0;
             }
 
+            if (controlId == MAXGLB_ID_EXPORT_ALPHA_MODE &&
+                notificationCode == CBN_SELCHANGE)
+            {
+                UpdateExportDialogEnabledState(
+                    context);
+                return 0;
+            }
+
             if (controlId == MAXGLB_ID_EXPORT_INFO)
             {
                 MessageBox(
@@ -6421,6 +7392,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     _T("MaxGLB2016 exports static models for editing, optimization and arrangement workflows.\n\n")
                     _T("Uniform scale multiplies all baked world-space positions. Normalize instead scales the complete export uniformly so its largest dimension matches the requested Max-unit value.\n\n")
                     _T("GLB stores all enabled textures inside the output file. Standard material colors and opacity can still be exported when texture export is disabled.\n\n")
+                    _T("Alpha Auto preserves OPAQUE, BLEND, MASK and alphaCutoff from imported GLB materials. For manually created Max materials it chooses BLEND when opacity is present, otherwise OPAQUE. MASK can be forced with a custom cutoff.\n\n")
                     _T("Animation is intentionally outside the current static-model workflow."),
                     _T("MaxGLB2016 Export Information"),
                     MB_OK |
@@ -6441,6 +7413,7 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
             {
                 float scaleFactor = 1.0f;
                 float normalizeTarget = 1.0f;
+                float alphaCutoff = 0.5f;
 
                 const BOOL normalizeSize =
                     GetImportCheckboxState(
@@ -6474,6 +7447,29 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                     return 0;
                 }
 
+                const int selectedAlphaMode =
+                    static_cast<int>(
+                        SendMessage(
+                            context->alphaModeCombo,
+                            CB_GETCURSEL,
+                            0,
+                            0));
+
+                if (selectedAlphaMode ==
+                        MAXGLB_ALPHA_MASK &&
+                    !TryReadUnitFloat(
+                        context->alphaCutoffEdit,
+                        &alphaCutoff))
+                {
+                    MessageBox(
+                        window,
+                        _T("Alpha cutoff must be a number between 0 and 1."),
+                        _T("MaxGLB2016"),
+                        MB_OK |
+                        MB_ICONWARNING);
+                    return 0;
+                }
+
                 context->settings.scaleFactor =
                     scaleFactor;
 
@@ -6489,6 +7485,15 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->settings.exportMaterials =
                     GetImportCheckboxState(
                         context->materialsCheck);
+
+                context->settings.alphaMode =
+                    context->settings.exportMaterials
+                    ? selectedAlphaMode
+                    : MAXGLB_ALPHA_OPAQUE;
+
+                context->settings.alphaCutoff =
+                    ClampMaxGLBAlphaCutoff(
+                        alphaCutoff);
 
                 context->settings.exportTextures =
                     context->settings.exportMaterials &&
@@ -6838,6 +7843,50 @@ static void BuildImportedNodeName(
             outputName,
             outputNameCount,
             baseName);
+    }
+}
+
+
+static void BuildImportedMeshNodeName(
+    const cgltf_node* sourceNode,
+    const cgltf_mesh* sourceMesh,
+    int importObjectIndex,
+    TCHAR* outputName,
+    size_t outputNameCount)
+{
+    if (outputName == NULL ||
+        outputNameCount == 0)
+    {
+        return;
+    }
+
+    outputName[0] =
+        _T('\0');
+
+    if (sourceNode != NULL)
+    {
+        ConvertUtf8ToTchar(
+            sourceNode->name,
+            outputName,
+            outputNameCount);
+    }
+
+    if (outputName[0] == _T('\0') &&
+        sourceMesh != NULL)
+    {
+        ConvertUtf8ToTchar(
+            sourceMesh->name,
+            outputName,
+            outputNameCount);
+    }
+
+    if (outputName[0] == _T('\0'))
+    {
+        _stprintf_s(
+            outputName,
+            outputNameCount,
+            _T("MaxGLB2016_Mesh_%d"),
+            importObjectIndex);
     }
 }
 
@@ -7580,6 +8629,1077 @@ static BOOL ImportPrimitiveAsNode(
 
 
 
+struct MaxGLBPrimitiveImportInfo
+{
+    cgltf_primitive* primitive;
+
+    const cgltf_accessor* positions;
+    const cgltf_accessor* texcoords;
+    const cgltf_accessor* normals;
+
+    cgltf_size faceCount;
+
+    size_t uvBase;
+    size_t normalBase;
+
+    int materialId;
+
+    BOOL hasUv;
+    BOOL hasNormals;
+
+    std::vector<int> sourceToWelded;
+
+    MaxGLBPrimitiveImportInfo()
+        : primitive(NULL)
+        , positions(NULL)
+        , texcoords(NULL)
+        , normals(NULL)
+        , faceCount(0)
+        , uvBase(0)
+        , normalBase(0)
+        , materialId(0)
+        , hasUv(FALSE)
+        , hasNormals(FALSE)
+    {
+    }
+};
+
+
+static StdMat2* CreateDefaultImportedSubMaterial(
+    int materialId)
+{
+    StdMat2* material =
+        NewDefaultStdMat();
+
+    if (material == NULL)
+    {
+        return NULL;
+    }
+
+    TCHAR materialName[128];
+
+    _stprintf_s(
+        materialName,
+        _countof(materialName),
+        _T("MaxGLB2016_Default_%d"),
+        materialId + 1);
+
+    material->SetName(materialName);
+
+    material->SetDiffuse(
+        Color(
+            0.8f,
+            0.8f,
+            0.8f),
+        0);
+
+    return material;
+}
+
+
+static BOOL ImportMeshPrimitivesAsNode(
+    cgltf_data* data,
+    const TCHAR* sourceFilename,
+    const cgltf_node* sourceNode,
+    cgltf_mesh* sourceMesh,
+    int importObjectIndex,
+    Interface* maxInterface,
+    MaxGLBImportStats* importStats,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (data == NULL ||
+        sourceFilename == NULL ||
+        sourceNode == NULL ||
+        sourceMesh == NULL ||
+        maxInterface == NULL ||
+        importStats == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("The importer received invalid multi-primitive mesh data."));
+        return FALSE;
+    }
+
+    std::vector<MaxGLBPrimitiveImportInfo> primitiveInfos;
+
+    primitiveInfos.reserve(
+        static_cast<size_t>(
+            sourceMesh->primitives_count));
+
+    cgltf_size totalFaceCount = 0;
+    size_t totalSourceVertexCount = 0;
+
+    BOOL anyUv = FALSE;
+    BOOL allHaveNormals = TRUE;
+
+    for (cgltf_size sourcePrimitiveIndex = 0;
+         sourcePrimitiveIndex <
+            sourceMesh->primitives_count;
+         ++sourcePrimitiveIndex)
+    {
+        cgltf_primitive* primitive =
+            &sourceMesh->primitives[
+                sourcePrimitiveIndex];
+
+        if (primitive->type !=
+            cgltf_primitive_type_triangles)
+        {
+            continue;
+        }
+
+        const cgltf_accessor* positions =
+            cgltf_find_accessor(
+                primitive,
+                cgltf_attribute_type_position,
+                0);
+
+        if (positions == NULL ||
+            positions->type !=
+                cgltf_type_vec3 ||
+            positions->count == 0)
+        {
+            continue;
+        }
+
+        if (positions->is_sparse)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("Sparse POSITION accessors are not supported yet."));
+            return FALSE;
+        }
+
+        MaxGLBPrimitiveImportInfo info;
+
+        info.primitive =
+            primitive;
+
+        info.positions =
+            positions;
+
+        info.texcoords =
+            cgltf_find_accessor(
+                primitive,
+                cgltf_attribute_type_texcoord,
+                0);
+
+        info.normals =
+            cgltf_find_accessor(
+                primitive,
+                cgltf_attribute_type_normal,
+                0);
+
+        info.hasUv =
+            info.texcoords != NULL;
+
+        info.hasNormals =
+            info.normals != NULL;
+
+        if (info.hasUv)
+        {
+            if (info.texcoords->type !=
+                    cgltf_type_vec2 ||
+                info.texcoords->count !=
+                    positions->count ||
+                info.texcoords->is_sparse)
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A multi-primitive mesh contains incompatible TEXCOORD_0 data."));
+                return FALSE;
+            }
+
+            anyUv =
+                TRUE;
+        }
+
+        if (info.hasNormals)
+        {
+            if (info.normals->type !=
+                    cgltf_type_vec3 ||
+                info.normals->count !=
+                    positions->count ||
+                info.normals->is_sparse)
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A multi-primitive mesh contains incompatible NORMAL data."));
+                return FALSE;
+            }
+        }
+        else
+        {
+            allHaveNormals =
+                FALSE;
+        }
+
+        const cgltf_size indexCount =
+            primitive->indices != NULL
+            ? primitive->indices->count
+            : positions->count;
+
+        if (indexCount < 3 ||
+            (indexCount % 3) != 0)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("A primitive index count is not a valid triangle list."));
+            return FALSE;
+        }
+
+        if (primitive->indices != NULL &&
+            primitive->indices->is_sparse)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("Sparse index accessors are not supported yet."));
+            return FALSE;
+        }
+
+        info.faceCount =
+            indexCount / 3;
+
+        if (positions->count >
+                static_cast<cgltf_size>(
+                    INT_MAX) ||
+            info.faceCount >
+                static_cast<cgltf_size>(
+                    INT_MAX))
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("A primitive is too large for this 3ds Max importer."));
+            return FALSE;
+        }
+
+        if (totalFaceCount >
+                static_cast<cgltf_size>(
+                    INT_MAX) -
+                info.faceCount ||
+            totalSourceVertexCount >
+                static_cast<size_t>(
+                    INT_MAX) -
+                static_cast<size_t>(
+                    positions->count))
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The combined mesh is too large for this 3ds Max importer."));
+            return FALSE;
+        }
+
+        info.materialId =
+            static_cast<int>(
+                primitiveInfos.size());
+
+        info.uvBase =
+            totalSourceVertexCount;
+
+        info.normalBase =
+            totalSourceVertexCount;
+
+        totalFaceCount +=
+            info.faceCount;
+
+        totalSourceVertexCount +=
+            static_cast<size_t>(
+                positions->count);
+
+        primitiveInfos.push_back(
+            info);
+    }
+
+    if (primitiveInfos.empty())
+    {
+        return TRUE;
+    }
+
+    TCHAR importedNodeName[256];
+
+    BuildImportedMeshNodeName(
+        sourceNode,
+        sourceMesh,
+        importObjectIndex,
+        importedNodeName,
+        _countof(importedNodeName));
+
+    TCHAR importProgressStep[384];
+
+    _stprintf_s(
+        importProgressStep,
+        _countof(importProgressStep),
+        _T("Importing %s (%d material primitives)"),
+        importedNodeName,
+        static_cast<int>(
+            primitiveInfos.size()));
+
+    const int startingPrimitiveCount =
+        importStats->primitiveCount;
+
+    const int importProgressPercent =
+        5 +
+        (startingPrimitiveCount * 88) /
+        (g_activeImportPrimitiveCount > 0
+            ? g_activeImportPrimitiveCount
+            : 1);
+
+    if (!UpdateMaxGLBProgress(
+            importProgressPercent,
+            importProgressStep))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
+    cgltf_float gltfWorld[16] =
+    {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    BuildGltfWorldMatrix(
+        data,
+        sourceNode,
+        gltfWorld);
+
+    std::vector<Point3> weldedPositions;
+    std::map<MaxGLBPositionKey, int> weldedLookup;
+
+    weldedPositions.reserve(
+        totalSourceVertexCount);
+
+    for (size_t primitiveInfoIndex = 0;
+         primitiveInfoIndex <
+            primitiveInfos.size();
+         ++primitiveInfoIndex)
+    {
+        MaxGLBPrimitiveImportInfo& info =
+            primitiveInfos[
+                primitiveInfoIndex];
+
+        info.sourceToWelded.resize(
+            static_cast<size_t>(
+                info.positions->count));
+
+        for (cgltf_size sourceVertexIndex = 0;
+             sourceVertexIndex <
+                info.positions->count;
+             ++sourceVertexIndex)
+        {
+            if ((sourceVertexIndex & 4095) == 0 &&
+                !ContinueMaxGLBOperation(
+                    errorMessage,
+                    errorMessageCount))
+            {
+                return FALSE;
+            }
+
+            cgltf_float localPosition[3];
+
+            if (!cgltf_accessor_read_float(
+                    info.positions,
+                    sourceVertexIndex,
+                    localPosition,
+                    3))
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A vertex position could not be read."));
+                return FALSE;
+            }
+
+            cgltf_float worldPosition[3];
+
+            TransformGltfPoint(
+                gltfWorld,
+                localPosition[0],
+                localPosition[1],
+                localPosition[2],
+                worldPosition);
+
+            const Point3 maxPosition =
+                ConvertGltfLocalPositionToMax(
+                    worldPosition);
+
+            const MaxGLBPositionKey key(
+                maxPosition);
+
+            std::map<
+                MaxGLBPositionKey,
+                int>::iterator existing =
+                    weldedLookup.find(key);
+
+            int weldedIndex;
+
+            if (existing !=
+                weldedLookup.end())
+            {
+                weldedIndex =
+                    existing->second;
+            }
+            else
+            {
+                if (weldedPositions.size() >=
+                    static_cast<size_t>(
+                        INT_MAX))
+                {
+                    _tcscpy_s(
+                        errorMessage,
+                        errorMessageCount,
+                        _T("The welded mesh contains too many vertices."));
+                    return FALSE;
+                }
+
+                weldedIndex =
+                    static_cast<int>(
+                        weldedPositions.size());
+
+                weldedPositions.push_back(
+                    maxPosition);
+
+                weldedLookup.insert(
+                    std::make_pair(
+                        key,
+                        weldedIndex));
+            }
+
+            info.sourceToWelded[
+                static_cast<size_t>(
+                    sourceVertexIndex)] =
+                weldedIndex;
+        }
+    }
+
+    TriObject* triObject =
+        CreateNewTriObject();
+
+    if (triObject == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create a combined TriObject."));
+        return FALSE;
+    }
+
+    Mesh& maxMesh =
+        triObject->GetMesh();
+
+    maxMesh.setNumVerts(
+        static_cast<int>(
+            weldedPositions.size()));
+
+    maxMesh.setNumFaces(
+        static_cast<int>(
+            totalFaceCount));
+
+    for (size_t weldedIndex = 0;
+         weldedIndex <
+            weldedPositions.size();
+         ++weldedIndex)
+    {
+        maxMesh.setVert(
+            static_cast<int>(
+                weldedIndex),
+            weldedPositions[
+                weldedIndex]);
+    }
+
+    if (anyUv)
+    {
+        maxMesh.setNumTVerts(
+            static_cast<int>(
+                totalSourceVertexCount));
+
+        maxMesh.setNumTVFaces(
+            static_cast<int>(
+                totalFaceCount));
+    }
+
+    MeshNormalSpec* specifiedNormals =
+        NULL;
+
+    if (allHaveNormals)
+    {
+        maxMesh.SpecifyNormals();
+
+        specifiedNormals =
+            maxMesh.GetSpecifiedNormals();
+
+        if (specifiedNormals == NULL)
+        {
+            triObject->DeleteThis();
+
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("3ds Max could not allocate combined specified normals."));
+            return FALSE;
+        }
+
+        specifiedNormals->SetParent(
+            &maxMesh);
+
+        if (!specifiedNormals->SetNumFaces(
+                static_cast<int>(
+                    totalFaceCount)) ||
+            !specifiedNormals->SetNumNormals(
+                static_cast<int>(
+                    totalSourceVertexCount)))
+        {
+            triObject->DeleteThis();
+
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("3ds Max could not allocate the combined normal data."));
+            return FALSE;
+        }
+    }
+
+    for (size_t primitiveInfoIndex = 0;
+         primitiveInfoIndex <
+            primitiveInfos.size();
+         ++primitiveInfoIndex)
+    {
+        const MaxGLBPrimitiveImportInfo& info =
+            primitiveInfos[
+                primitiveInfoIndex];
+
+        for (cgltf_size sourceVertexIndex = 0;
+             sourceVertexIndex <
+                info.positions->count;
+             ++sourceVertexIndex)
+        {
+            const size_t combinedVertexIndex =
+                info.uvBase +
+                static_cast<size_t>(
+                    sourceVertexIndex);
+
+            if (anyUv)
+            {
+                UVVert importedUv(
+                    0.0f,
+                    0.0f,
+                    0.0f);
+
+                if (info.hasUv)
+                {
+                    cgltf_float texCoord[2];
+
+                    if (!cgltf_accessor_read_float(
+                            info.texcoords,
+                            sourceVertexIndex,
+                            texCoord,
+                            2))
+                    {
+                        triObject->DeleteThis();
+
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("A TEXCOORD_0 value could not be read."));
+                        return FALSE;
+                    }
+
+                    importedUv =
+                        UVVert(
+                            static_cast<float>(
+                                texCoord[0]),
+                            static_cast<float>(
+                                1.0f -
+                                texCoord[1]),
+                            0.0f);
+                }
+
+                maxMesh.tVerts[
+                    static_cast<int>(
+                        combinedVertexIndex)] =
+                    importedUv;
+            }
+
+            if (allHaveNormals)
+            {
+                cgltf_float sourceNormal[3];
+
+                if (!cgltf_accessor_read_float(
+                        info.normals,
+                        sourceVertexIndex,
+                        sourceNormal,
+                        3))
+                {
+                    triObject->DeleteThis();
+
+                    _tcscpy_s(
+                        errorMessage,
+                        errorMessageCount,
+                        _T("A NORMAL value could not be read."));
+                    return FALSE;
+                }
+
+                specifiedNormals->Normal(
+                    static_cast<int>(
+                        info.normalBase +
+                        static_cast<size_t>(
+                            sourceVertexIndex))) =
+                    TransformGltfNormalToMaxWorld(
+                        gltfWorld,
+                        sourceNormal);
+
+                specifiedNormals->SetNormalExplicit(
+                    static_cast<int>(
+                        info.normalBase +
+                        static_cast<size_t>(
+                            sourceVertexIndex)),
+                    true);
+            }
+        }
+    }
+
+    int destinationFaceIndex = 0;
+
+    for (size_t primitiveInfoIndex = 0;
+         primitiveInfoIndex <
+            primitiveInfos.size();
+         ++primitiveInfoIndex)
+    {
+        const MaxGLBPrimitiveImportInfo& info =
+            primitiveInfos[
+                primitiveInfoIndex];
+
+        for (cgltf_size localFaceIndex = 0;
+             localFaceIndex <
+                info.faceCount;
+             ++localFaceIndex)
+        {
+            if ((localFaceIndex & 4095) == 0 &&
+                !ContinueMaxGLBOperation(
+                    errorMessage,
+                    errorMessageCount))
+            {
+                triObject->DeleteThis();
+                return FALSE;
+            }
+
+            cgltf_size sourceIndices[3];
+
+            if (info.primitive->indices != NULL)
+            {
+                sourceIndices[0] =
+                    cgltf_accessor_read_index(
+                        info.primitive->indices,
+                        localFaceIndex * 3 + 0);
+
+                sourceIndices[1] =
+                    cgltf_accessor_read_index(
+                        info.primitive->indices,
+                        localFaceIndex * 3 + 1);
+
+                sourceIndices[2] =
+                    cgltf_accessor_read_index(
+                        info.primitive->indices,
+                        localFaceIndex * 3 + 2);
+            }
+            else
+            {
+                sourceIndices[0] =
+                    localFaceIndex * 3 + 0;
+
+                sourceIndices[1] =
+                    localFaceIndex * 3 + 1;
+
+                sourceIndices[2] =
+                    localFaceIndex * 3 + 2;
+            }
+
+            if (sourceIndices[0] >=
+                    info.positions->count ||
+                sourceIndices[1] >=
+                    info.positions->count ||
+                sourceIndices[2] >=
+                    info.positions->count)
+            {
+                triObject->DeleteThis();
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("A primitive contains an invalid vertex index."));
+                return FALSE;
+            }
+
+            Face& face =
+                maxMesh.faces[
+                    destinationFaceIndex];
+
+            face.setVerts(
+                info.sourceToWelded[
+                    static_cast<size_t>(
+                        sourceIndices[0])],
+                info.sourceToWelded[
+                    static_cast<size_t>(
+                        sourceIndices[1])],
+                info.sourceToWelded[
+                    static_cast<size_t>(
+                        sourceIndices[2])]);
+
+            face.setEdgeVisFlags(
+                1,
+                1,
+                1);
+
+            face.setSmGroup(1);
+
+            face.setMatID(
+                static_cast<MtlID>(
+                    info.materialId));
+
+            if (anyUv)
+            {
+                maxMesh.tvFace[
+                    destinationFaceIndex]
+                    .setTVerts(
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[0])),
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[1])),
+                        static_cast<int>(
+                            info.uvBase +
+                            static_cast<size_t>(
+                                sourceIndices[2])));
+            }
+
+            if (allHaveNormals)
+            {
+                MeshNormalFace& normalFace =
+                    specifiedNormals->Face(
+                        destinationFaceIndex);
+
+                normalFace.SpecifyNormalID(
+                    0,
+                    static_cast<int>(
+                        info.normalBase +
+                        static_cast<size_t>(
+                            sourceIndices[0])));
+
+                normalFace.SpecifyNormalID(
+                    1,
+                    static_cast<int>(
+                        info.normalBase +
+                        static_cast<size_t>(
+                            sourceIndices[1])));
+
+                normalFace.SpecifyNormalID(
+                    2,
+                    static_cast<int>(
+                        info.normalBase +
+                        static_cast<size_t>(
+                            sourceIndices[2])));
+            }
+
+            ++destinationFaceIndex;
+        }
+    }
+
+    maxMesh.InvalidateGeomCache();
+    maxMesh.InvalidateTopologyCache();
+
+    if (allHaveNormals)
+    {
+        specifiedNormals->SetAllExplicit(
+            true);
+
+        specifiedNormals->CheckNormals();
+    }
+    else
+    {
+        maxMesh.buildNormals();
+    }
+
+    std::vector<Mtl*> importedSubMaterials;
+
+    importedSubMaterials.resize(
+        primitiveInfos.size(),
+        NULL);
+
+    int materialCount = 0;
+
+    for (size_t primitiveInfoIndex = 0;
+         primitiveInfoIndex <
+            primitiveInfos.size();
+         ++primitiveInfoIndex)
+    {
+        if (!ContinueMaxGLBOperation(
+                errorMessage,
+                errorMessageCount))
+        {
+            triObject->DeleteThis();
+            return FALSE;
+        }
+
+        Mtl* importedMaterial =
+            NULL;
+
+        BOOL hasBaseColorTexture =
+            FALSE;
+
+        BOOL hasNormalTexture =
+            FALSE;
+
+        BOOL hasOrmChannels =
+            FALSE;
+
+        BOOL hasEmissiveTexture =
+            FALSE;
+
+        g_importTextureSetIndex =
+            importObjectIndex;
+
+        if (!CreateStandardMaterialForPrimitive(
+                primitiveInfos[
+                    primitiveInfoIndex]
+                    .primitive,
+                sourceFilename,
+                maxInterface,
+                &importedMaterial,
+                &hasBaseColorTexture,
+                &hasNormalTexture,
+                &hasOrmChannels,
+                &hasEmissiveTexture,
+                errorMessage,
+                errorMessageCount))
+        {
+            triObject->DeleteThis();
+
+            for (size_t cleanupIndex = 0;
+                 cleanupIndex <
+                    importedSubMaterials.size();
+                 ++cleanupIndex)
+            {
+                if (importedSubMaterials[
+                        cleanupIndex] != NULL)
+                {
+                    importedSubMaterials[
+                        cleanupIndex]
+                        ->DeleteThis();
+                }
+            }
+
+            return FALSE;
+        }
+
+        if (importedMaterial == NULL)
+        {
+            importedMaterial =
+                CreateDefaultImportedSubMaterial(
+                    static_cast<int>(
+                        primitiveInfoIndex));
+
+            if (importedMaterial == NULL)
+            {
+                triObject->DeleteThis();
+
+                for (size_t cleanupIndex = 0;
+                     cleanupIndex <
+                        importedSubMaterials.size();
+                     ++cleanupIndex)
+                {
+                    if (importedSubMaterials[
+                            cleanupIndex] != NULL)
+                    {
+                        importedSubMaterials[
+                            cleanupIndex]
+                            ->DeleteThis();
+                    }
+                }
+
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("3ds Max could not create a default sub-material."));
+                return FALSE;
+            }
+        }
+
+        importedSubMaterials[
+            primitiveInfoIndex] =
+            importedMaterial;
+
+        ++materialCount;
+
+        if (hasBaseColorTexture)
+        {
+            ++importStats->baseColorTextures;
+        }
+
+        if (hasNormalTexture)
+        {
+            ++importStats->normalTextures;
+        }
+
+        if (hasOrmChannels)
+        {
+            ++importStats->ormTextures;
+        }
+
+        if (hasEmissiveTexture)
+        {
+            ++importStats->emissiveTextures;
+        }
+    }
+
+    MultiMtl* multiMaterial =
+        NewDefaultMultiMtl();
+
+    if (multiMaterial == NULL)
+    {
+        triObject->DeleteThis();
+
+        for (size_t cleanupIndex = 0;
+             cleanupIndex <
+                importedSubMaterials.size();
+             ++cleanupIndex)
+        {
+            if (importedSubMaterials[
+                    cleanupIndex] != NULL)
+            {
+                importedSubMaterials[
+                    cleanupIndex]
+                    ->DeleteThis();
+            }
+        }
+
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create a Multi/Sub-Object material."));
+        return FALSE;
+    }
+
+    TCHAR multiMaterialName[320];
+
+    _stprintf_s(
+        multiMaterialName,
+        _countof(multiMaterialName),
+        _T("%s_Multi"),
+        importedNodeName);
+
+    multiMaterial->SetName(
+        multiMaterialName);
+
+    multiMaterial->SetNumSubMtls(
+        static_cast<int>(
+            importedSubMaterials.size()));
+
+    for (size_t materialIndex = 0;
+         materialIndex <
+            importedSubMaterials.size();
+         ++materialIndex)
+    {
+        multiMaterial->SetSubMtl(
+            static_cast<int>(
+                materialIndex),
+            importedSubMaterials[
+                materialIndex]);
+    }
+
+    INode* maxNode =
+        maxInterface->CreateObjectNode(
+            triObject);
+
+    if (maxNode == NULL)
+    {
+        triObject->DeleteThis();
+        multiMaterial->DeleteThis();
+
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create a scene node for the combined mesh."));
+        return FALSE;
+    }
+
+    maxNode->SetNodeTM(
+        maxInterface->GetTime(),
+        Matrix3(1));
+
+    maxNode->SetName(
+        importedNodeName);
+
+    maxNode->SetMtl(
+        multiMaterial);
+
+    importStats->createdNodes.push_back(
+        maxNode);
+
+    ++importStats->objectCount;
+
+    importStats->primitiveCount +=
+        static_cast<int>(
+            primitiveInfos.size());
+
+    importStats->totalVertexCount +=
+        static_cast<int>(
+            weldedPositions.size());
+
+    importStats->totalFaceCount +=
+        static_cast<int>(
+            totalFaceCount);
+
+    if (anyUv)
+    {
+        ++importStats->objectsWithUv;
+    }
+
+    if (allHaveNormals)
+    {
+        ++importStats->objectsWithNormals;
+    }
+
+    importStats->materials +=
+        materialCount;
+
+    const int completedImportPercent =
+        5 +
+        (importStats->primitiveCount * 88) /
+        (g_activeImportPrimitiveCount > 0
+            ? g_activeImportPrimitiveCount
+            : 1);
+
+    if (!UpdateMaxGLBProgress(
+            completedImportPercent,
+            importProgressStep))
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("Import cancelled by the user."));
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
 static BOOL ImportNodeMeshesRecursive(
     cgltf_data* data,
     const TCHAR* sourceFilename,
@@ -7599,26 +9719,17 @@ static BOOL ImportNodeMeshesRecursive(
         cgltf_mesh* sourceMesh =
             sourceNode->mesh;
 
+        int validPrimitiveCount = 0;
+        int singleValidPrimitiveIndex = -1;
+
         for (cgltf_size primitiveIndex = 0;
-             primitiveIndex < sourceMesh->primitives_count;
+             primitiveIndex <
+                sourceMesh->primitives_count;
              ++primitiveIndex)
         {
-            if (!ContinueMaxGLBOperation(
-                    errorMessage,
-                    errorMessageCount))
-            {
-                return FALSE;
-            }
-
             cgltf_primitive* primitive =
                 &sourceMesh->primitives[
                     primitiveIndex];
-
-            if (primitive->type !=
-                cgltf_primitive_type_triangles)
-            {
-                continue;
-            }
 
             const cgltf_accessor* positions =
                 cgltf_find_accessor(
@@ -7626,22 +9737,60 @@ static BOOL ImportNodeMeshesRecursive(
                     cgltf_attribute_type_position,
                     0);
 
-            if (positions == NULL ||
-                positions->type != cgltf_type_vec3 ||
-                positions->count == 0)
+            if (primitive->type ==
+                    cgltf_primitive_type_triangles &&
+                positions != NULL &&
+                positions->type ==
+                    cgltf_type_vec3 &&
+                positions->count > 0)
             {
-                continue;
+                ++validPrimitiveCount;
+
+                singleValidPrimitiveIndex =
+                    static_cast<int>(
+                        primitiveIndex);
+            }
+        }
+
+        if (validPrimitiveCount > 1)
+        {
+            if (importStats->nextObjectIndex ==
+                INT_MAX)
+            {
+                _tcscpy_s(
+                    errorMessage,
+                    errorMessageCount,
+                    _T("The GLB contains too many mesh nodes."));
+                return FALSE;
             }
 
-            if (primitiveIndex >
-                    static_cast<cgltf_size>(INT_MAX) ||
+            const int objectIndex =
+                importStats->nextObjectIndex++;
+
+            if (!ImportMeshPrimitivesAsNode(
+                    data,
+                    sourceFilename,
+                    sourceNode,
+                    sourceMesh,
+                    objectIndex,
+                    maxInterface,
+                    importStats,
+                    errorMessage,
+                    errorMessageCount))
+            {
+                return FALSE;
+            }
+        }
+        else if (validPrimitiveCount == 1)
+        {
+            if (singleValidPrimitiveIndex < 0 ||
                 importStats->nextObjectIndex ==
                     INT_MAX)
             {
                 _tcscpy_s(
                     errorMessage,
                     errorMessageCount,
-                    _T("The GLB contains too many mesh primitives."));
+                    _T("The GLB contains an invalid mesh primitive."));
                 return FALSE;
             }
 
@@ -7653,9 +9802,9 @@ static BOOL ImportNodeMeshesRecursive(
                     sourceFilename,
                     sourceNode,
                     sourceMesh,
-                    primitive,
-                    static_cast<int>(
-                        primitiveIndex),
+                    &sourceMesh->primitives[
+                        singleValidPrimitiveIndex],
+                    singleValidPrimitiveIndex,
                     objectIndex,
                     maxInterface,
                     importStats,
@@ -7668,13 +9817,15 @@ static BOOL ImportNodeMeshesRecursive(
     }
 
     for (cgltf_size childIndex = 0;
-         childIndex < sourceNode->children_count;
+         childIndex <
+            sourceNode->children_count;
          ++childIndex)
     {
         if (!ImportNodeMeshesRecursive(
                 data,
                 sourceFilename,
-                sourceNode->children[childIndex],
+                sourceNode->children[
+                    childIndex],
                 maxInterface,
                 importStats,
                 errorMessage,
@@ -8014,7 +10165,7 @@ public:
 
     unsigned int Version()
     {
-        return 103;
+        return 109;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -8140,12 +10291,44 @@ public:
 
         cgltf_data* data = NULL;
 
-        cgltf_result parseResult =
+        // JSON numbers always use a dot as decimal separator. 3ds Max can
+        // run under a comma-decimal Windows locale, while cgltf 1.15 uses
+        // the process C numeric locale during parsing. Preserve the user's
+        // locale, force "C" only for cgltf_parse(), then restore it.
+        char previousNumericLocale[128];
+        previousNumericLocale[0] = '\0';
+
+        const char* currentNumericLocale =
+            setlocale(
+                LC_NUMERIC,
+                NULL);
+
+        if (currentNumericLocale != NULL)
+        {
+            strncpy_s(
+                previousNumericLocale,
+                _countof(previousNumericLocale),
+                currentNumericLocale,
+                _TRUNCATE);
+        }
+
+        setlocale(
+            LC_NUMERIC,
+            "C");
+
+        const cgltf_result parseResult =
             cgltf_parse(
                 &options,
                 fileBytes,
                 static_cast<cgltf_size>(fileSize),
                 &data);
+
+        if (previousNumericLocale[0] != '\0')
+        {
+            setlocale(
+                LC_NUMERIC,
+                previousNumericLocale);
+        }
 
         if (parseResult != cgltf_result_success ||
             data == NULL)
@@ -8277,7 +10460,7 @@ public:
         if (g_activeImportSettings.normalizeSize &&
             !ComputeNormalizedImportScale(
                 data,
-                g_activeImportSettings.rotationXDegrees,
+                g_activeImportSettings.rotationMatrix,
                 g_activeImportSettings.normalizeTargetSize,
                 &g_activeImportSettings.appliedUniformScale))
         {
@@ -8395,11 +10578,13 @@ public:
                 _T("Emissive textures: %d\n\n")
                 _T("Import behavior:\n")
                 _T("- every mesh node in the active scene is imported\n")
-                _T("- every triangle primitive becomes a Max object\n")
+                _T("- every glTF mesh node becomes one Max object\n")
+                _T("- multiple primitives become Face Material IDs\n")
+                _T("- Multi/Sub-Object materials are created automatically\n")
                 _T("- original node names are preserved\n")
                 _T("- full source hierarchy transforms are baked into geometry\n")
                 _T("- standard glTF Y-up to Max Z-up conversion\n")
-                _T("- additional X correction: %.1f degrees\n")
+                _T("- import orientation: 3x3 rotation matrix\n")
                 _T("- textures imported: %s\n")
                 _T("- normalize size: %s\n")
                 _T("- requested largest dimension: %.3f\n")
@@ -8419,7 +10604,6 @@ public:
                 importStats.normalTextures,
                 importStats.ormTextures,
                 importStats.emissiveTextures,
-                g_activeImportSettings.rotationXDegrees,
                 g_activeImportSettings.importTextures
                     ? _T("yes")
                     : _T("no"),
@@ -8486,7 +10670,9 @@ struct MaxGLBExportMaterial
 {
     BOOL present;
     BOOL doubleSided;
-    BOOL alphaBlend;
+    int alphaMode;
+    float alphaCutoff;
+    DWORD alphaMetadataFlags;
     BOOL preservedOriginalOrm;
 
     float baseColor[4];
@@ -8499,7 +10685,9 @@ struct MaxGLBExportMaterial
     MaxGLBExportMaterial()
         : present(FALSE)
         , doubleSided(FALSE)
-        , alphaBlend(FALSE)
+        , alphaMode(MAXGLB_ALPHA_OPAQUE)
+        , alphaCutoff(0.5f)
+        , alphaMetadataFlags(0)
         , preservedOriginalOrm(FALSE)
     {
         baseColor[0] = 1.0f;
@@ -8512,6 +10700,13 @@ struct MaxGLBExportMaterial
 
 struct MaxGLBExportMesh
 {
+    // One entry represents one glTF primitive.
+    // Entries sharing nodeGroupIndex belong to the same Max object and are
+    // written as multiple primitives of one glTF mesh.
+    int nodeGroupIndex;
+    int sourceMaterialId;
+
+    std::string nodeName;
     std::string name;
 
     // glTF uses one shared index for POSITION, NORMAL and TEXCOORD_0.
@@ -8530,7 +10725,9 @@ struct MaxGLBExportMesh
     float maximum[3];
 
     MaxGLBExportMesh()
-        : hasTexcoords(FALSE)
+        : nodeGroupIndex(-1)
+        , sourceMaterialId(0)
+        , hasTexcoords(FALSE)
     {
         minimum[0] = minimum[1] = minimum[2] = 0.0f;
         maximum[0] = maximum[1] = maximum[2] = 0.0f;
@@ -9974,21 +12171,18 @@ static unsigned char GetGrayValue(
 
 
 static BOOL CaptureMaterialMaps(
-    INode* node,
+    Mtl* nodeMaterial,
+    const TCHAR* fallbackMaterialName,
     TimeValue timeValue,
-    BOOL exportTextures,
+    const MaxGLBExportSettings& exportSettings,
     MaxGLBExportMaterial* outputMaterial,
     TCHAR* errorMessage,
     size_t errorMessageCount)
 {
-    if (node == NULL ||
-        outputMaterial == NULL)
+    if (outputMaterial == NULL)
     {
         return TRUE;
     }
-
-    Mtl* nodeMaterial =
-        node->GetMtl();
 
     if (nodeMaterial == NULL)
     {
@@ -10010,17 +12204,19 @@ static BOOL CaptureMaterialMaps(
 
     outputMaterial->name =
         ConvertTcharToUtf8(
-            node->GetName());
+            nodeMaterial->GetName());
+
+    if (outputMaterial->name.empty())
+    {
+        outputMaterial->name =
+            ConvertTcharToUtf8(
+                fallbackMaterialName);
+    }
 
     if (outputMaterial->name.empty())
     {
         outputMaterial->name =
             "MaxGLB_Material";
-    }
-    else
-    {
-        outputMaterial->name +=
-            "_Material";
     }
 
     const Color diffuseColor =
@@ -10044,14 +12240,61 @@ static BOOL CaptureMaterialMaps(
     outputMaterial->doubleSided =
         standardMaterial->GetTwoSided();
 
-    if (outputMaterial->baseColor[3] <
-        0.999f)
+    int storedAlphaMode =
+        MAXGLB_ALPHA_OPAQUE;
+
+    float storedAlphaCutoff =
+        0.5f;
+
+    DWORD storedAlphaFlags = 0;
+
+    const BOOL hasStoredAlpha =
+        ReadMaxGLBAlphaMetadata(
+            nodeMaterial,
+            &storedAlphaMode,
+            &storedAlphaCutoff,
+            &storedAlphaFlags);
+
+    outputMaterial->alphaMetadataFlags =
+        storedAlphaFlags;
+
+    if (exportSettings.alphaMode !=
+        MAXGLB_ALPHA_AUTO)
     {
-        outputMaterial->alphaBlend =
-            TRUE;
+        outputMaterial->alphaMode =
+            exportSettings.alphaMode;
+
+        outputMaterial->alphaCutoff =
+            exportSettings.alphaCutoff;
+    }
+    else if (hasStoredAlpha)
+    {
+        outputMaterial->alphaMode =
+            storedAlphaMode;
+
+        outputMaterial->alphaCutoff =
+            storedAlphaCutoff;
+    }
+    else
+    {
+        outputMaterial->alphaMode =
+            outputMaterial->baseColor[3] <
+                0.999f
+            ? MAXGLB_ALPHA_BLEND
+            : MAXGLB_ALPHA_OPAQUE;
+
+        outputMaterial->alphaCutoff =
+            exportSettings.alphaCutoff;
     }
 
-    if (!exportTextures)
+    if (outputMaterial->alphaMode ==
+        MAXGLB_ALPHA_OPAQUE)
+    {
+        outputMaterial->baseColor[3] =
+            1.0f;
+    }
+
+    if (!exportSettings.exportTextures)
     {
         return TRUE;
     }
@@ -10113,7 +12356,9 @@ static BOOL CaptureMaterialMaps(
         return FALSE;
     }
 
-    if (opacityBitmap != NULL)
+    if (opacityBitmap != NULL &&
+        outputMaterial->alphaMode !=
+            MAXGLB_ALPHA_OPAQUE)
     {
         MaxGLBExportImageData opacityImage;
 
@@ -10202,11 +12447,22 @@ static BOOL CaptureMaterialMaps(
                     decodedOpacity,
                     pixelIndex);
 
-            combinedBaseColor.rgba[
-                alphaIndex] =
-                    static_cast<unsigned char>(
-                        (existingAlpha *
-                         opacity) / 255);
+            if ((outputMaterial->alphaMetadataFlags &
+                 MAXGLB_ALPHA_FLAG_OPACITY_FROM_BASE_ALPHA) != 0)
+            {
+                combinedBaseColor.rgba[
+                    alphaIndex] =
+                        static_cast<unsigned char>(
+                            opacity);
+            }
+            else
+            {
+                combinedBaseColor.rgba[
+                    alphaIndex] =
+                        static_cast<unsigned char>(
+                            (existingAlpha *
+                             opacity) / 255);
+            }
         }
 
         MaxGLBExportImageData& baseOutput =
@@ -10231,8 +12487,13 @@ static BOOL CaptureMaterialMaps(
         baseOutput.mimeType =
             "image/png";
 
-        outputMaterial->alphaBlend =
-            TRUE;
+        if (exportSettings.alphaMode ==
+                MAXGLB_ALPHA_AUTO &&
+            !hasStoredAlpha)
+        {
+            outputMaterial->alphaMode =
+                MAXGLB_ALPHA_BLEND;
+        }
     }
     else if (diffuseImage.present)
     {
@@ -10262,8 +12523,14 @@ static BOOL CaptureMaterialMaps(
                         pixelIndex * 4 + 3] <
                     255)
                 {
-                    outputMaterial->alphaBlend =
-                        TRUE;
+                    if (exportSettings.alphaMode ==
+                            MAXGLB_ALPHA_AUTO &&
+                        !hasStoredAlpha)
+                    {
+                        outputMaterial->alphaMode =
+                            MAXGLB_ALPHA_BLEND;
+                    }
+
                     break;
                 }
             }
@@ -10519,11 +12786,46 @@ static BOOL CaptureMaterialMaps(
 }
 
 
-static BOOL TryBuildExportMesh(
+static Mtl* ResolveFaceMaterial(
+    Mtl* rootMaterial,
+    int materialId)
+{
+    if (rootMaterial == NULL)
+    {
+        return NULL;
+    }
+
+    if (rootMaterial->IsMultiMtl())
+    {
+        const int subMaterialCount =
+            rootMaterial->NumSubMtls();
+
+        if (materialId >= 0 &&
+            materialId < subMaterialCount)
+        {
+            Mtl* subMaterial =
+                rootMaterial->GetSubMtl(
+                    materialId);
+
+            if (subMaterial != NULL)
+            {
+                return subMaterial;
+            }
+        }
+
+        return NULL;
+    }
+
+    return rootMaterial;
+}
+
+
+static BOOL TryBuildExportMeshes(
     INode* node,
     TimeValue timeValue,
     const MaxGLBExportSettings& settings,
-    MaxGLBExportMesh* outputMesh,
+    int nodeGroupIndex,
+    std::vector<MaxGLBExportMesh>& outputMeshes,
     BOOL* outWasGeometry,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -10533,11 +12835,10 @@ static BOOL TryBuildExportMesh(
         *outWasGeometry = FALSE;
     }
 
-    if (node == NULL || outputMesh == NULL)
+    if (node == NULL)
     {
         return TRUE;
     }
-
 
     TCHAR exportProgressStep[384];
 
@@ -10618,31 +12919,41 @@ static BOOL TryBuildExportMesh(
         return TRUE;
     }
 
-    outputMesh->name =
+    std::string nodeName =
         ConvertTcharToUtf8(
             node->GetName());
 
-    if (outputMesh->name.empty())
+    if (nodeName.empty())
     {
-        outputMesh->name =
+        nodeName =
             "MaxGLB_Mesh";
     }
 
-    if (settings.exportMaterials &&
-        !CaptureMaterialMaps(
-            node,
-            timeValue,
-            settings.exportTextures,
-            &outputMesh->material,
-            errorMessage,
-            errorMessageCount))
-    {
-        if (deleteConvertedObject)
-        {
-            triangleObject->DeleteThis();
-        }
+    Mtl* rootMaterial =
+        node->GetMtl();
 
-        return FALSE;
+    const BOOL usesMultiMaterial =
+        rootMaterial != NULL &&
+        rootMaterial->IsMultiMtl() &&
+        rootMaterial->NumSubMtls() > 0;
+
+    std::set<int> usedMaterialIds;
+
+    if (usesMultiMaterial)
+    {
+        for (int faceIndex = 0;
+             faceIndex < faceCount;
+             ++faceIndex)
+        {
+            usedMaterialIds.insert(
+                static_cast<int>(
+                    mesh.faces[faceIndex]
+                        .getMatID()));
+        }
+    }
+    else
+    {
+        usedMaterialIds.insert(0);
     }
 
     const Matrix3 objectTransform =
@@ -10652,8 +12963,7 @@ static BOOL TryBuildExportMesh(
         GetMatrixDeterminant3x3(
             objectTransform) < 0.0f;
 
-    // Channel 1 is the traditional Max diffuse UV channel.
-    outputMesh->hasTexcoords =
+    const BOOL hasTexcoords =
         mesh.getNumTVerts() > 0 &&
         mesh.tVerts != NULL &&
         mesh.tvFace != NULL;
@@ -10661,8 +12971,6 @@ static BOOL TryBuildExportMesh(
     const int textureVertexCount =
         mesh.getNumTVerts();
 
-    // This preserves existing explicit normals and also builds normals
-    // from smoothing groups when a mesh has no explicit normal data.
     mesh.SpecifyNormals();
 
     MeshNormalSpec* normalSpec =
@@ -10674,38 +12982,14 @@ static BOOL TryBuildExportMesh(
         normalSpec->CheckNormals();
     }
 
-    const size_t outputVertexCount =
-        static_cast<size_t>(faceCount) * 3;
+    int primitiveNumber = 0;
 
-    outputMesh->positions.reserve(
-        outputVertexCount * 3);
-
-    outputMesh->normals.reserve(
-        outputVertexCount * 3);
-
-    if (outputMesh->hasTexcoords)
+    for (std::set<int>::const_iterator materialIdIterator =
+            usedMaterialIds.begin();
+         materialIdIterator != usedMaterialIds.end();
+         ++materialIdIterator)
     {
-        outputMesh->texcoords.reserve(
-            outputVertexCount * 2);
-    }
-
-    outputMesh->indices.reserve(
-        outputVertexCount);
-
-    BOOL boundsInitialized = FALSE;
-
-    // Reuse a glTF vertex whenever all attributes are identical.
-    // This welds vertices inside continuous UV/smoothing regions while
-    // preserving UV seams and hard normal boundaries.
-    std::map<MaxGLBExportVertexKey, unsigned int>
-        exportedVertexLookup;
-
-    for (int faceIndex = 0;
-         faceIndex < faceCount;
-         ++faceIndex)
-    {
-        if ((faceIndex & 4095) == 0 &&
-            !ContinueMaxGLBOperation(
+        if (!ContinueMaxGLBOperation(
                 errorMessage,
                 errorMessageCount))
         {
@@ -10717,129 +13001,158 @@ static BOOL TryBuildExportMesh(
             return FALSE;
         }
 
-        const Face& face =
-            mesh.faces[faceIndex];
+        const int materialId =
+            *materialIdIterator;
 
-        int cornerOrder[3] =
-        {
-            0,
-            1,
-            2
-        };
+        MaxGLBExportMesh outputMesh;
 
-        if (reverseWinding)
+        outputMesh.nodeGroupIndex =
+            nodeGroupIndex;
+
+        outputMesh.sourceMaterialId =
+            materialId;
+
+        outputMesh.nodeName =
+            nodeName;
+
+        outputMesh.name =
+            nodeName;
+
+        if (usedMaterialIds.size() > 1)
         {
-            cornerOrder[1] = 2;
-            cornerOrder[2] = 1;
+            std::ostringstream primitiveName;
+            primitiveName
+                << nodeName
+                << "_MaterialID_"
+                << (materialId + 1);
+
+            outputMesh.name =
+                primitiveName.str();
         }
 
-        Point3 fallbackPositions[3];
+        outputMesh.hasTexcoords =
+            hasTexcoords;
 
-        for (int sourceCorner = 0;
-             sourceCorner < 3;
-             ++sourceCorner)
+        Mtl* faceMaterial =
+            ResolveFaceMaterial(
+                rootMaterial,
+                materialId);
+
+        if (settings.exportMaterials &&
+            !CaptureMaterialMaps(
+                faceMaterial,
+                node->GetName(),
+                timeValue,
+                settings,
+                &outputMesh.material,
+                errorMessage,
+                errorMessageCount))
         {
-            const int sourceVertexIndex =
-                face.v[sourceCorner];
+            if (deleteConvertedObject)
+            {
+                triangleObject->DeleteThis();
+            }
 
-            if (sourceVertexIndex < 0 ||
-                sourceVertexIndex >=
-                    sourceVertexCount)
+            return FALSE;
+        }
+
+        size_t matchingFaceCount = 0;
+
+        for (int faceIndex = 0;
+             faceIndex < faceCount;
+             ++faceIndex)
+        {
+            if (!usesMultiMaterial ||
+                static_cast<int>(
+                    mesh.faces[faceIndex]
+                        .getMatID()) == materialId)
+            {
+                ++matchingFaceCount;
+            }
+        }
+
+        if (matchingFaceCount == 0)
+        {
+            continue;
+        }
+
+        const size_t maximumOutputVertexCount =
+            matchingFaceCount * 3;
+
+        outputMesh.positions.reserve(
+            maximumOutputVertexCount * 3);
+
+        outputMesh.normals.reserve(
+            maximumOutputVertexCount * 3);
+
+        if (outputMesh.hasTexcoords)
+        {
+            outputMesh.texcoords.reserve(
+                maximumOutputVertexCount * 2);
+        }
+
+        outputMesh.indices.reserve(
+            maximumOutputVertexCount);
+
+        BOOL boundsInitialized = FALSE;
+
+        std::map<
+            MaxGLBExportVertexKey,
+            unsigned int> exportedVertexLookup;
+
+        for (int faceIndex = 0;
+             faceIndex < faceCount;
+             ++faceIndex)
+        {
+            if (usesMultiMaterial &&
+                static_cast<int>(
+                    mesh.faces[faceIndex]
+                        .getMatID()) != materialId)
+            {
+                continue;
+            }
+
+            if ((faceIndex & 4095) == 0 &&
+                !ContinueMaxGLBOperation(
+                    errorMessage,
+                    errorMessageCount))
             {
                 if (deleteConvertedObject)
                 {
                     triangleObject->DeleteThis();
                 }
 
-                _tcscpy_s(
-                    errorMessage,
-                    errorMessageCount,
-                    _T("A mesh contains an invalid face vertex index."));
                 return FALSE;
             }
 
-            fallbackPositions[sourceCorner] =
-                ConvertMaxWorldPositionToGltf(
-                    mesh.getVert(sourceVertexIndex) *
-                    objectTransform);
-        }
+            const Face& face =
+                mesh.faces[faceIndex];
 
-        Point3 fallbackFaceNormal =
-            CrossProd(
-                fallbackPositions[1] -
-                    fallbackPositions[0],
-                fallbackPositions[2] -
-                    fallbackPositions[0]);
-
-        if (reverseWinding)
-        {
-            fallbackFaceNormal =
-                -fallbackFaceNormal;
-        }
-
-        const float fallbackLengthSquared =
-            DotProd(
-                fallbackFaceNormal,
-                fallbackFaceNormal);
-
-        if (fallbackLengthSquared > 1.0e-20f)
-        {
-            fallbackFaceNormal /=
-                sqrtf(fallbackLengthSquared);
-        }
-        else
-        {
-            fallbackFaceNormal =
-                Point3(0.0f, 1.0f, 0.0f);
-        }
-
-        for (int outputCorner = 0;
-             outputCorner < 3;
-             ++outputCorner)
-        {
-            const int sourceCorner =
-                cornerOrder[outputCorner];
-
-            const int sourceVertexIndex =
-                face.v[sourceCorner];
-
-            const Point3 gltfPosition =
-                fallbackPositions[sourceCorner];
-
-            Point3 gltfNormal =
-                fallbackFaceNormal;
-
-            if (normalSpec != NULL &&
-                normalSpec->GetNumFaces() ==
-                    faceCount)
+            int cornerOrder[3] =
             {
-                const Point3 localNormal =
-                    normalSpec->GetNormal(
-                        faceIndex,
-                        sourceCorner);
+                0,
+                1,
+                2
+            };
 
-                const Point3 worldNormal =
-                    TransformNormalToWorld(
-                        localNormal,
-                        objectTransform);
-
-                gltfNormal =
-                    ConvertMaxWorldNormalToGltf(
-                        worldNormal);
+            if (reverseWinding)
+            {
+                cornerOrder[1] = 2;
+                cornerOrder[2] = 1;
             }
 
-            float gltfU = 0.0f;
-            float gltfV = 0.0f;
+            Point3 fallbackPositions[3];
 
-            if (outputMesh->hasTexcoords)
+            for (int sourceCorner = 0;
+                 sourceCorner < 3;
+                 ++sourceCorner)
             {
-                const int textureVertexIndex =
-                    mesh.tvFace[faceIndex]
-                        .t[sourceCorner];
+                const int sourceVertexIndex =
+                    face.v[sourceCorner];
 
-                if (textureVertexIndex < 0 ||
-                    textureVertexIndex >=
-                        textureVertexCount)
+                if (sourceVertexIndex < 0 ||
+                    sourceVertexIndex >=
+                        sourceVertexCount)
                 {
                     if (deleteConvertedObject)
                     {
@@ -10849,129 +13162,239 @@ static BOOL TryBuildExportMesh(
                     _tcscpy_s(
                         errorMessage,
                         errorMessageCount,
-                        _T("A mesh contains an invalid channel-1 UV index."));
+                        _T("A mesh contains an invalid face vertex index."));
                     return FALSE;
                 }
 
-                const UVVert& maxUv =
-                    mesh.tVerts[
-                        textureVertexIndex];
-
-                gltfU =
-                    maxUv.x;
-
-                // Reverse the importer's V conversion.
-                gltfV =
-                    1.0f - maxUv.y;
+                fallbackPositions[sourceCorner] =
+                    ConvertMaxWorldPositionToGltf(
+                        mesh.getVert(
+                            sourceVertexIndex) *
+                        objectTransform);
             }
 
-            const MaxGLBExportVertexKey vertexKey(
-                gltfPosition,
-                gltfNormal,
-                outputMesh->hasTexcoords,
-                gltfU,
-                gltfV);
+            Point3 fallbackFaceNormal =
+                CrossProd(
+                    fallbackPositions[1] -
+                        fallbackPositions[0],
+                    fallbackPositions[2] -
+                        fallbackPositions[0]);
 
-            std::map<
-                MaxGLBExportVertexKey,
-                unsigned int>::iterator existingVertex =
-                    exportedVertexLookup.find(
-                        vertexKey);
-
-            unsigned int exportVertexIndex;
-
-            if (existingVertex !=
-                exportedVertexLookup.end())
+            if (reverseWinding)
             {
-                exportVertexIndex =
-                    existingVertex->second;
+                fallbackFaceNormal =
+                    -fallbackFaceNormal;
+            }
+
+            const float fallbackLengthSquared =
+                DotProd(
+                    fallbackFaceNormal,
+                    fallbackFaceNormal);
+
+            if (fallbackLengthSquared > 1.0e-20f)
+            {
+                fallbackFaceNormal /=
+                    sqrtf(
+                        fallbackLengthSquared);
             }
             else
             {
-                exportVertexIndex =
-                    static_cast<unsigned int>(
-                        outputMesh->positions.size() / 3);
+                fallbackFaceNormal =
+                    Point3(
+                        0.0f,
+                        1.0f,
+                        0.0f);
+            }
 
-                outputMesh->positions.push_back(
-                    gltfPosition.x);
+            for (int outputCorner = 0;
+                 outputCorner < 3;
+                 ++outputCorner)
+            {
+                const int sourceCorner =
+                    cornerOrder[outputCorner];
 
-                outputMesh->positions.push_back(
-                    gltfPosition.y);
+                const int sourceVertexIndex =
+                    face.v[sourceCorner];
 
-                outputMesh->positions.push_back(
-                    gltfPosition.z);
+                const Point3 gltfPosition =
+                    fallbackPositions[
+                        sourceCorner];
 
-                outputMesh->normals.push_back(
-                    gltfNormal.x);
+                Point3 gltfNormal =
+                    fallbackFaceNormal;
 
-                outputMesh->normals.push_back(
-                    gltfNormal.y);
-
-                outputMesh->normals.push_back(
-                    gltfNormal.z);
-
-                if (outputMesh->hasTexcoords)
+                if (normalSpec != NULL &&
+                    normalSpec->GetNumFaces() ==
+                        faceCount)
                 {
-                    outputMesh->texcoords.push_back(
-                        gltfU);
+                    const Point3 localNormal =
+                        normalSpec->GetNormal(
+                            faceIndex,
+                            sourceCorner);
 
-                    outputMesh->texcoords.push_back(
-                        gltfV);
+                    const Point3 worldNormal =
+                        TransformNormalToWorld(
+                            localNormal,
+                            objectTransform);
+
+                    gltfNormal =
+                        ConvertMaxWorldNormalToGltf(
+                            worldNormal);
                 }
 
-                exportedVertexLookup.insert(
-                    std::make_pair(
-                        vertexKey,
-                        exportVertexIndex));
+                float gltfU = 0.0f;
+                float gltfV = 0.0f;
 
-                if (!boundsInitialized)
+                if (outputMesh.hasTexcoords)
                 {
-                    outputMesh->minimum[0] =
-                        outputMesh->maximum[0] =
-                            gltfPosition.x;
+                    const int textureVertexIndex =
+                        mesh.tvFace[faceIndex]
+                            .t[sourceCorner];
 
-                    outputMesh->minimum[1] =
-                        outputMesh->maximum[1] =
-                            gltfPosition.y;
+                    if (textureVertexIndex < 0 ||
+                        textureVertexIndex >=
+                            textureVertexCount)
+                    {
+                        if (deleteConvertedObject)
+                        {
+                            triangleObject->DeleteThis();
+                        }
 
-                    outputMesh->minimum[2] =
-                        outputMesh->maximum[2] =
-                            gltfPosition.z;
+                        _tcscpy_s(
+                            errorMessage,
+                            errorMessageCount,
+                            _T("A mesh contains an invalid channel-1 UV index."));
+                        return FALSE;
+                    }
 
-                    boundsInitialized = TRUE;
+                    const UVVert& maxUv =
+                        mesh.tVerts[
+                            textureVertexIndex];
+
+                    gltfU =
+                        maxUv.x;
+
+                    gltfV =
+                        1.0f - maxUv.y;
+                }
+
+                const MaxGLBExportVertexKey vertexKey(
+                    gltfPosition,
+                    gltfNormal,
+                    outputMesh.hasTexcoords,
+                    gltfU,
+                    gltfV);
+
+                std::map<
+                    MaxGLBExportVertexKey,
+                    unsigned int>::iterator existingVertex =
+                        exportedVertexLookup.find(
+                            vertexKey);
+
+                unsigned int exportVertexIndex;
+
+                if (existingVertex !=
+                    exportedVertexLookup.end())
+                {
+                    exportVertexIndex =
+                        existingVertex->second;
                 }
                 else
                 {
-                    const float positionValues[3] =
-                    {
-                        gltfPosition.x,
-                        gltfPosition.y,
-                        gltfPosition.z
-                    };
+                    exportVertexIndex =
+                        static_cast<unsigned int>(
+                            outputMesh.positions.size() / 3);
 
-                    for (int axisIndex = 0;
-                         axisIndex < 3;
-                         ++axisIndex)
-                    {
-                        if (positionValues[axisIndex] <
-                            outputMesh->minimum[axisIndex])
-                        {
-                            outputMesh->minimum[axisIndex] =
-                                positionValues[axisIndex];
-                        }
+                    outputMesh.positions.push_back(
+                        gltfPosition.x);
 
-                        if (positionValues[axisIndex] >
-                            outputMesh->maximum[axisIndex])
+                    outputMesh.positions.push_back(
+                        gltfPosition.y);
+
+                    outputMesh.positions.push_back(
+                        gltfPosition.z);
+
+                    outputMesh.normals.push_back(
+                        gltfNormal.x);
+
+                    outputMesh.normals.push_back(
+                        gltfNormal.y);
+
+                    outputMesh.normals.push_back(
+                        gltfNormal.z);
+
+                    if (outputMesh.hasTexcoords)
+                    {
+                        outputMesh.texcoords.push_back(
+                            gltfU);
+
+                        outputMesh.texcoords.push_back(
+                            gltfV);
+                    }
+
+                    exportedVertexLookup.insert(
+                        std::make_pair(
+                            vertexKey,
+                            exportVertexIndex));
+
+                    if (!boundsInitialized)
+                    {
+                        outputMesh.minimum[0] =
+                            outputMesh.maximum[0] =
+                                gltfPosition.x;
+
+                        outputMesh.minimum[1] =
+                            outputMesh.maximum[1] =
+                                gltfPosition.y;
+
+                        outputMesh.minimum[2] =
+                            outputMesh.maximum[2] =
+                                gltfPosition.z;
+
+                        boundsInitialized =
+                            TRUE;
+                    }
+                    else
+                    {
+                        const float positionValues[3] =
                         {
-                            outputMesh->maximum[axisIndex] =
-                                positionValues[axisIndex];
+                            gltfPosition.x,
+                            gltfPosition.y,
+                            gltfPosition.z
+                        };
+
+                        for (int axisIndex = 0;
+                             axisIndex < 3;
+                             ++axisIndex)
+                        {
+                            if (positionValues[axisIndex] <
+                                outputMesh.minimum[axisIndex])
+                            {
+                                outputMesh.minimum[axisIndex] =
+                                    positionValues[axisIndex];
+                            }
+
+                            if (positionValues[axisIndex] >
+                                outputMesh.maximum[axisIndex])
+                            {
+                                outputMesh.maximum[axisIndex] =
+                                    positionValues[axisIndex];
+                            }
                         }
                     }
                 }
-            }
 
-            outputMesh->indices.push_back(
-                exportVertexIndex);
+                outputMesh.indices.push_back(
+                    exportVertexIndex);
+            }
+        }
+
+        if (!outputMesh.indices.empty())
+        {
+            outputMeshes.push_back(
+                outputMesh);
+
+            ++primitiveNumber;
         }
     }
 
@@ -10982,7 +13405,8 @@ static BOOL TryBuildExportMesh(
 
     if (outWasGeometry != NULL)
     {
-        *outWasGeometry = TRUE;
+        *outWasGeometry =
+            primitiveNumber > 0;
     }
 
     return TRUE;
@@ -11018,14 +13442,14 @@ static BOOL CollectSceneMeshesRecursive(
             continue;
         }
 
-        MaxGLBExportMesh exportMesh;
         BOOL wasGeometry = FALSE;
 
-        if (!TryBuildExportMesh(
+        if (!TryBuildExportMeshes(
                 childNode,
                 timeValue,
                 settings,
-                &exportMesh,
+                g_exportNextNodeGroupIndex,
+                outputMeshes,
                 &wasGeometry,
                 errorMessage,
                 errorMessageCount))
@@ -11037,8 +13461,7 @@ static BOOL CollectSceneMeshesRecursive(
 
         if (wasGeometry)
         {
-            outputMeshes.push_back(
-                exportMesh);
+            ++g_exportNextNodeGroupIndex;
         }
 
         if (!CollectSceneMeshesRecursive(
@@ -11099,14 +13522,14 @@ static BOOL CollectMeshesForExport(
                 maxInterface->GetSelNode(
                     selectedNodeIndex);
 
-            MaxGLBExportMesh exportMesh;
             BOOL wasGeometry = FALSE;
 
-            if (!TryBuildExportMesh(
+            if (!TryBuildExportMeshes(
                     selectedNode,
                     timeValue,
                     settings,
-                    &exportMesh,
+                    g_exportNextNodeGroupIndex,
+                    outputMeshes,
                     &wasGeometry,
                     errorMessage,
                     errorMessageCount))
@@ -11118,8 +13541,7 @@ static BOOL CollectMeshesForExport(
 
             if (wasGeometry)
             {
-                outputMeshes.push_back(
-                    exportMesh);
+                ++g_exportNextNodeGroupIndex;
             }
         }
     }
@@ -11715,6 +14137,73 @@ static BOOL CommitTemporaryExportFile(
 }
 
 
+static size_t CountExportNodeGroups(
+    const std::vector<MaxGLBExportMesh>& primitives)
+{
+    size_t groupCount = 0;
+
+    for (size_t primitiveIndex = 0;
+         primitiveIndex < primitives.size();
+         ++primitiveIndex)
+    {
+        const int groupIndex =
+            primitives[primitiveIndex]
+                .nodeGroupIndex;
+
+        if (groupIndex >= 0 &&
+            static_cast<size_t>(
+                groupIndex + 1) > groupCount)
+        {
+            groupCount =
+                static_cast<size_t>(
+                    groupIndex + 1);
+        }
+    }
+
+    return groupCount;
+}
+
+
+static const MaxGLBExportMesh* FindFirstExportPrimitiveForGroup(
+    const std::vector<MaxGLBExportMesh>& primitives,
+    int groupIndex)
+{
+    for (size_t primitiveIndex = 0;
+         primitiveIndex < primitives.size();
+         ++primitiveIndex)
+    {
+        if (primitives[primitiveIndex]
+                .nodeGroupIndex == groupIndex)
+        {
+            return &primitives[primitiveIndex];
+        }
+    }
+
+    return NULL;
+}
+
+
+static size_t CountPrimitivesForGroup(
+    const std::vector<MaxGLBExportMesh>& primitives,
+    int groupIndex)
+{
+    size_t primitiveCount = 0;
+
+    for (size_t primitiveIndex = 0;
+         primitiveIndex < primitives.size();
+         ++primitiveIndex)
+    {
+        if (primitives[primitiveIndex]
+                .nodeGroupIndex == groupIndex)
+        {
+            ++primitiveCount;
+        }
+    }
+
+    return primitiveCount;
+}
+
+
 static BOOL WriteGeometryGlbFile(
     const TCHAR* outputFilename,
     const std::vector<MaxGLBExportMesh>& meshes,
@@ -11925,6 +14414,9 @@ static BOOL WriteGeometryGlbFile(
 
     PadBinaryToFourBytes(binaryData);
 
+    const size_t nodeGroupCount =
+        CountExportNodeGroups(meshes);
+
     std::ostringstream json;
     json.imbue(std::locale::classic());
     json << std::setprecision(9);
@@ -11939,7 +14431,7 @@ static BOOL WriteGeometryGlbFile(
         << "\"scenes\":[{\"nodes\":[";
 
     for (size_t nodeIndex = 0;
-         nodeIndex < meshes.size();
+         nodeIndex < nodeGroupCount;
          ++nodeIndex)
     {
         if (nodeIndex > 0)
@@ -11955,7 +14447,7 @@ static BOOL WriteGeometryGlbFile(
         << "\"nodes\":[";
 
     for (size_t nodeIndex = 0;
-         nodeIndex < meshes.size();
+         nodeIndex < nodeGroupCount;
          ++nodeIndex)
     {
         if (nodeIndex > 0)
@@ -11963,13 +14455,21 @@ static BOOL WriteGeometryGlbFile(
             json << ",";
         }
 
+        const MaxGLBExportMesh* firstPrimitive =
+            FindFirstExportPrimitiveForGroup(
+                meshes,
+                static_cast<int>(
+                    nodeIndex));
+
         json
             << "{"
             << "\"mesh\":"
             << nodeIndex
             << ",\"name\":\""
             << EscapeJsonString(
-                meshes[nodeIndex].name)
+                firstPrimitive != NULL
+                    ? firstPrimitive->nodeName
+                    : std::string("MaxGLB_Mesh"))
             << "\""
             << "}";
     }
@@ -11978,55 +14478,91 @@ static BOOL WriteGeometryGlbFile(
         << "],"
         << "\"meshes\":[";
 
-    for (size_t meshIndex = 0;
-         meshIndex < meshes.size();
-         ++meshIndex)
+    for (size_t groupIndex = 0;
+         groupIndex < nodeGroupCount;
+         ++groupIndex)
     {
-        if (meshIndex > 0)
+        if (groupIndex > 0)
         {
             json << ",";
         }
 
-        const MaxGLBExportMesh& mesh =
-            meshes[meshIndex];
-
-        const MaxGLBExportLayout& layout =
-            layouts[meshIndex];
+        const MaxGLBExportMesh* firstPrimitive =
+            FindFirstExportPrimitiveForGroup(
+                meshes,
+                static_cast<int>(
+                    groupIndex));
 
         json
             << "{"
             << "\"name\":\""
-            << EscapeJsonString(mesh.name)
+            << EscapeJsonString(
+                firstPrimitive != NULL
+                    ? firstPrimitive->nodeName
+                    : std::string("MaxGLB_Mesh"))
             << "\","
-            << "\"primitives\":[{"
-            << "\"attributes\":{"
-            << "\"POSITION\":"
-            << layout.positionAccessor
-            << ",\"NORMAL\":"
-            << layout.normalAccessor;
+            << "\"primitives\":[";
 
-        if (mesh.hasTexcoords)
+        BOOL firstPrimitiveJson = TRUE;
+
+        for (size_t primitiveIndex = 0;
+             primitiveIndex < meshes.size();
+             ++primitiveIndex)
         {
+            const MaxGLBExportMesh& mesh =
+                meshes[primitiveIndex];
+
+            if (mesh.nodeGroupIndex !=
+                static_cast<int>(
+                    groupIndex))
+            {
+                continue;
+            }
+
+            const MaxGLBExportLayout& layout =
+                layouts[primitiveIndex];
+
+            if (!firstPrimitiveJson)
+            {
+                json << ",";
+            }
+
+            firstPrimitiveJson = FALSE;
+
             json
-                << ",\"TEXCOORD_0\":"
-                << layout.texcoordAccessor;
+                << "{"
+                << "\"attributes\":{"
+                << "\"POSITION\":"
+                << layout.positionAccessor
+                << ",\"NORMAL\":"
+                << layout.normalAccessor;
+
+            if (mesh.hasTexcoords)
+            {
+                json
+                    << ",\"TEXCOORD_0\":"
+                    << layout.texcoordAccessor;
+            }
+
+            json
+                << "},"
+                << "\"indices\":"
+                << layout.indexAccessor;
+
+            if (layout.hasMaterial)
+            {
+                json
+                    << ",\"material\":"
+                    << layout.materialIndex;
+            }
+
+            json
+                << ",\"mode\":4"
+                << "}";
         }
 
         json
-            << "},"
-            << "\"indices\":"
-            << layout.indexAccessor;
-
-        if (layout.hasMaterial)
-        {
-            json
-                << ",\"material\":"
-                << layout.materialIndex;
-        }
-
-        json
-            << ",\"mode\":4"
-            << "}]"
+            << "]"
             << "}";
     }
 
@@ -12327,10 +14863,19 @@ static BOOL WriteGeometryGlbFile(
                     << ",\"doubleSided\":true";
             }
 
-            if (mesh.material.alphaBlend)
+            if (mesh.material.alphaMode ==
+                MAXGLB_ALPHA_BLEND)
             {
                 json
                     << ",\"alphaMode\":\"BLEND\"";
+            }
+            else if (mesh.material.alphaMode ==
+                MAXGLB_ALPHA_MASK)
+            {
+                json
+                    << ",\"alphaMode\":\"MASK\""
+                    << ",\"alphaCutoff\":"
+                    << mesh.material.alphaCutoff;
             }
 
             json << "}";
@@ -12448,8 +14993,8 @@ static BOOL WriteGeometryGlbFile(
                 ? "selected"
                 : "scene")
         << "\","
-        << "\"geometryStage\":5,"
-        << "\"materialStage\":\"allMaps\""
+        << "\"geometryStage\":9,"
+        << "\"materialStage\":\"multiSubObject\""
         << "}"
         << "}";
 
@@ -12667,7 +15212,7 @@ public:
 
     unsigned int Version()
     {
-        return 108;
+        return 111;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -12720,6 +15265,7 @@ public:
         errorMessage[0] = _T('\0');
 
         g_exportProgressProcessedNodes = 0;
+        g_exportNextNodeGroupIndex = 0;
 
         if (selectedOnly)
         {
@@ -12854,16 +15400,21 @@ public:
 
         EndMaxGLBProgress();
 
+        const size_t exportedObjectCount =
+            CountExportNodeGroups(meshes);
+
         size_t totalVertexCount = 0;
         size_t totalTriangleCount = 0;
-        size_t meshesWithUvs = 0;
+        size_t primitivesWithUvs = 0;
+        size_t multiMaterialObjects = 0;
         size_t exportedMaterials = 0;
         size_t exportedBaseColorTextures = 0;
         size_t exportedNormalTextures = 0;
         size_t exportedOrmTextures = 0;
         size_t exactOrmRoundTrips = 0;
         size_t exportedEmissiveTextures = 0;
-        size_t alphaMaterials = 0;
+        size_t alphaBlendMaterials = 0;
+        size_t alphaMaskMaterials = 0;
 
         for (size_t meshIndex = 0;
              meshIndex < meshes.size();
@@ -12879,7 +15430,7 @@ public:
 
             if (meshes[meshIndex].hasTexcoords)
             {
-                ++meshesWithUvs;
+                ++primitivesWithUvs;
             }
 
             if (meshes[meshIndex].material.present)
@@ -12916,57 +15467,87 @@ public:
                 ++exportedEmissiveTextures;
             }
 
-            if (meshes[meshIndex].material.alphaBlend)
+            if (meshes[meshIndex].material.alphaMode ==
+                MAXGLB_ALPHA_BLEND)
             {
-                ++alphaMaterials;
+                ++alphaBlendMaterials;
+            }
+            else if (meshes[meshIndex].material.alphaMode ==
+                MAXGLB_ALPHA_MASK)
+            {
+                ++alphaMaskMaterials;
+            }
+        }
+
+        for (size_t groupIndex = 0;
+             groupIndex < exportedObjectCount;
+             ++groupIndex)
+        {
+            if (CountPrimitivesForGroup(
+                    meshes,
+                    static_cast<int>(
+                        groupIndex)) > 1)
+            {
+                ++multiMaterialObjects;
             }
         }
 
         if (!suppressPrompts &&
             exportSettings.showSummary)
         {
-            TCHAR message[1600];
+            TCHAR message[2300];
 
             _stprintf_s(
                 message,
                 _countof(message),
                 _T("GLB export completed.\n\n")
                 _T("Mode: %s\n")
-                _T("Meshes: %u\n")
+                _T("Max objects / glTF meshes: %u\n")
+                _T("glTF primitives: %u\n")
+                _T("Multi-material objects: %u\n")
                 _T("Export vertices: %u\n")
                 _T("Triangles: %u\n")
-                _T("Meshes with UV channel 1: %u\n")
-                _T("Standard materials: %u\n")
+                _T("Primitives with UV channel 1: %u\n")
+                _T("Standard sub-materials: %u\n")
                 _T("Base-color textures: %u\n")
                 _T("Normal textures: %u\n")
                 _T("Packed ORM textures: %u\n")
                 _T("Exact imported ORM round-trips: %u\n")
                 _T("Emissive textures: %u\n")
-                _T("Alpha/opacity materials: %u\n\n")
+                _T("Alpha BLEND materials: %u\n")
+                _T("Alpha MASK materials: %u\n\n")
                 _T("Export settings:\n")
                 _T("- size mode: %s\n")
                 _T("- applied uniform scale: %.7g\n")
                 _T("- materials: %s\n")
                 _T("- textures embedded in GLB: %s\n")
+                _T("- alpha mode setting: %s\n")
+                _T("- mask cutoff: %.4g\n")
                 _T("- animation: not exported\n\n")
                 _T("Geometry:\n")
                 _T("- evaluated modifier stack\n")
                 _T("- object transforms baked into geometry\n")
                 _T("- Max Z-up converted to glTF Y-up\n")
                 _T("- explicit normals and UV channel 1\n")
-                _T("- hard edges and UV seams preserved\n\n")
+                _T("- hard edges and UV seams preserved\n")
+                _T("- Face Material IDs exported as glTF primitives\n")
+                _T("- Multi/Sub-Object sub-materials preserved\n\n")
                 _T("Output:\n%s%s"),
                 selectedOnly
                     ? _T("Export Selected")
                     : _T("Export Scene"),
                 static_cast<unsigned int>(
+                    exportedObjectCount),
+                static_cast<unsigned int>(
                     meshes.size()),
+                static_cast<unsigned int>(
+                    multiMaterialObjects),
                 static_cast<unsigned int>(
                     totalVertexCount),
                 static_cast<unsigned int>(
                     totalTriangleCount),
                 static_cast<unsigned int>(
-                    meshesWithUvs),
+                    primitivesWithUvs),
                 static_cast<unsigned int>(
                     exportedMaterials),
                 static_cast<unsigned int>(
@@ -12980,7 +15561,9 @@ public:
                 static_cast<unsigned int>(
                     exportedEmissiveTextures),
                 static_cast<unsigned int>(
-                    alphaMaterials),
+                    alphaBlendMaterials),
+                static_cast<unsigned int>(
+                    alphaMaskMaterials),
                 exportSettings.normalizeSize
                     ? _T("normalize largest dimension")
                     : _T("uniform scale factor"),
@@ -12991,6 +15574,17 @@ public:
                 exportSettings.exportTextures
                     ? _T("yes")
                     : _T("no"),
+                exportSettings.alphaMode ==
+                        MAXGLB_ALPHA_AUTO
+                    ? _T("Auto / preserve")
+                    : exportSettings.alphaMode ==
+                            MAXGLB_ALPHA_OPAQUE
+                        ? _T("OPAQUE")
+                        : exportSettings.alphaMode ==
+                                MAXGLB_ALPHA_MASK
+                            ? _T("MASK")
+                            : _T("BLEND"),
+                exportSettings.alphaCutoff,
                 actualOutputFilename,
                 usedAlternateOutputFilename
                     ? _T("\n\nNOTE: The requested file was open or locked.\n")

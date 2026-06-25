@@ -10,6 +10,16 @@ GLB import and export for Autodesk 3ds Max 2016, focused on practical static-mod
 
 > **Status:** early public preview. MaxGLB2016 is intentionally narrow in scope: static triangle-mesh models, useful material conversion, and reliable GLB round-trips in 3ds Max 2016.
 
+<p align="center">
+  <a href="https://github.com/DINmatin/MaxGLB2016/releases/download/v0.1.0/MaxGLB2016-v0.1.0-win64.zip">
+    <strong>Download MaxGLB2016 v0.1.0 for Windows x64</strong>
+  </a>
+  <br>
+  <a href="https://github.com/DINmatin/MaxGLB2016/releases/tag/v0.1.0">
+    View release notes
+  </a>
+</p>
+
 ## Why this project exists
 
 Modern GLB assets are still useful in older production pipelines, but Autodesk 3ds Max 2016 has no built-in glTF/GLB workflow.

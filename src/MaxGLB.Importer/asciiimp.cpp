@@ -1,10 +1,13 @@
 #include <windows.h>
 #include <objbase.h>
 #include <wincodec.h>
+#include <uxtheme.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <tchar.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <map>
 #include <vector>
@@ -24,12 +27,79 @@
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "shell32.lib")
 
 HINSTANCE hInstance = NULL;
 
-// Import is single-threaded in 3ds Max 2016. This index keeps extracted
-// texture filenames unique when one GLB contains several mesh objects.
+// Import is single-threaded in 3ds Max 2016. Texture files use the stable
+// cgltf image index, so shared images and repeated imports reuse the same
+// extracted files instead of creating object-based duplicates.
 static int g_importTextureSetIndex = 0;
+static const cgltf_data* g_activeImportData = NULL;
+static std::map<const cgltf_image*, BOOL> g_splitOrmImagesThisImport;
+static std::map<const cgltf_image*, BOOL> g_unchangedImagesThisImport;
+
+
+struct MaxGLBImportSettings
+{
+    float rotationXDegrees;
+    BOOL importTextures;
+    BOOL addParentNode;
+    BOOL normalizeSize;
+    float normalizeTargetSize;
+    float appliedUniformScale;
+    BOOL importAnimation;
+
+    MaxGLBImportSettings()
+        : rotationXDegrees(0.0f)
+        , importTextures(TRUE)
+        , addParentNode(TRUE)
+        , normalizeSize(FALSE)
+        , normalizeTargetSize(1.0f)
+        , appliedUniformScale(1.0f)
+        , importAnimation(FALSE)
+    {
+    }
+};
+
+
+struct MaxGLBExportSettings
+{
+    float scaleFactor;
+    BOOL normalizeSize;
+    float normalizeTargetSize;
+    float appliedUniformScale;
+
+    BOOL exportMaterials;
+    BOOL exportTextures;
+
+    BOOL showSummary;
+    BOOL showInExplorer;
+    BOOL exportAnimation;
+
+    MaxGLBExportSettings()
+        : scaleFactor(1.0f)
+        , normalizeSize(FALSE)
+        , normalizeTargetSize(1.0f)
+        , appliedUniformScale(1.0f)
+        , exportMaterials(TRUE)
+        , exportTextures(TRUE)
+        , showSummary(TRUE)
+        , showInExplorer(FALSE)
+        , exportAnimation(FALSE)
+    {
+    }
+};
+
+
+// Import is single-threaded in 3ds Max 2016. These settings are active only
+// while one file is being imported. The last accepted values are remembered
+// for the next manually opened GLB.
+static MaxGLBImportSettings g_activeImportSettings;
+static MaxGLBImportSettings g_lastImportSettings;
+
+static MaxGLBExportSettings g_lastExportSettings;
 
 // Eigene, dauerhafte Class-ID fuer MaxGLB2016.
 // Diese Werte spaeter nicht mehr veraendern.
@@ -284,47 +354,80 @@ static void BuildGltfWorldMatrix(
 }
 
 
-static Point3 RotateMaxSceneXMinus90(
-    const Point3& point)
+static Point3 RotateMaxSceneAroundX(
+    const Point3& point,
+    float degrees)
 {
-    // Rotate the complete imported scene around the world origin
-    // by -90 degrees on the Max X axis.
-    //
-    // x' = x
-    // y' = z
-    // z' = -y
+    if (fabsf(degrees) < 1.0e-6f)
+    {
+        return point;
+    }
+
+    const float radians =
+        degrees *
+        3.14159265358979323846f /
+        180.0f;
+
+    const float cosine =
+        cosf(radians);
+
+    const float sine =
+        sinf(radians);
+
     return Point3(
         point.x,
-        point.z,
-        -point.y);
+        point.y * cosine - point.z * sine,
+        point.y * sine + point.z * cosine);
+}
+
+
+static Point3 ConvertGltfPositionToMax(
+    const cgltf_float* position,
+    float correctionXDegrees)
+{
+    // glTF is right-handed and Y-up. 3ds Max is Z-up. This standards-based
+    // coordinate conversion is always applied.
+    const Point3 maxPosition(
+        static_cast<float>(position[0]),
+        static_cast<float>(-position[2]),
+        static_cast<float>(position[1]));
+
+    // The optional correction is deliberately separate. It is useful for
+    // files whose authoring workflow added or omitted an orientation helper.
+    return RotateMaxSceneAroundX(
+        maxPosition,
+        correctionXDegrees);
 }
 
 
 static Point3 ConvertGltfLocalPositionToMax(
     const cgltf_float* position)
 {
-    // First convert glTF Y-up coordinates to Max Z-up coordinates.
-    Point3 maxPosition(
-        static_cast<float>(position[0]),
-        static_cast<float>(-position[2]),
-        static_cast<float>(position[1]));
+    Point3 converted =
+        ConvertGltfPositionToMax(
+            position,
+            g_activeImportSettings.rotationXDegrees);
 
-    // The tested Max 2016 scene requires one additional global
-    // -90 degree X rotation around 0,0,0.
-    return RotateMaxSceneXMinus90(maxPosition);
+    converted *=
+        g_activeImportSettings.appliedUniformScale;
+
+    return converted;
 }
 
 
-static Point3 ConvertGltfLocalNormalToMax(
-    const cgltf_float* normal)
+static Point3 ConvertGltfNormalToMax(
+    const cgltf_float* normal,
+    float correctionXDegrees)
 {
     Point3 maxNormal(
         static_cast<float>(normal[0]),
         static_cast<float>(-normal[2]),
         static_cast<float>(normal[1]));
 
-    // Apply the same global scene rotation to explicit normals.
-    maxNormal = RotateMaxSceneXMinus90(maxNormal);
+    maxNormal =
+        RotateMaxSceneAroundX(
+            maxNormal,
+            correctionXDegrees);
 
     const float lengthSquared =
         maxNormal.x * maxNormal.x +
@@ -340,6 +443,15 @@ static Point3 ConvertGltfLocalNormalToMax(
     }
 
     return maxNormal;
+}
+
+
+static Point3 ConvertGltfLocalNormalToMax(
+    const cgltf_float* normal)
+{
+    return ConvertGltfNormalToMax(
+        normal,
+        g_activeImportSettings.rotationXDegrees);
 }
 
 
@@ -580,9 +692,133 @@ static Point3 TransformGltfNormalToMaxWorld(
 
 
 
+static int GetStableImportImageIndex(
+    const cgltf_image* image)
+{
+    if (image != NULL &&
+        g_activeImportData != NULL)
+    {
+        for (cgltf_size imageIndex = 0;
+             imageIndex < g_activeImportData->images_count;
+             ++imageIndex)
+        {
+            if (&g_activeImportData->images[imageIndex] == image)
+            {
+                if (imageIndex <=
+                    static_cast<cgltf_size>(INT_MAX))
+                {
+                    return static_cast<int>(imageIndex);
+                }
+
+                break;
+            }
+        }
+    }
+
+    return g_importTextureSetIndex;
+}
+
+
+static BOOL ImportTextureFileExists(
+    const TCHAR* filePath)
+{
+    if (filePath == NULL ||
+        filePath[0] == _T('\0'))
+    {
+        return FALSE;
+    }
+
+    const DWORD attributes =
+        GetFileAttributes(filePath);
+
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+
+static BOOL ExistingFileMatchesBytes(
+    const TCHAR* filePath,
+    const unsigned char* bytes,
+    size_t byteCount)
+{
+    if (!ImportTextureFileExists(filePath) ||
+        bytes == NULL)
+    {
+        return FALSE;
+    }
+
+    FILE* inputFile = NULL;
+
+    if (_tfopen_s(
+            &inputFile,
+            filePath,
+            _T("rb")) != 0 ||
+        inputFile == NULL)
+    {
+        return FALSE;
+    }
+
+    if (_fseeki64(inputFile, 0, SEEK_END) != 0)
+    {
+        fclose(inputFile);
+        return FALSE;
+    }
+
+    const __int64 fileSize =
+        _ftelli64(inputFile);
+
+    if (fileSize < 0 ||
+        static_cast<unsigned __int64>(fileSize) !=
+            static_cast<unsigned __int64>(byteCount) ||
+        _fseeki64(inputFile, 0, SEEK_SET) != 0)
+    {
+        fclose(inputFile);
+        return FALSE;
+    }
+
+    unsigned char comparisonBuffer[65536];
+    size_t comparedBytes = 0;
+    BOOL matches = TRUE;
+
+    while (comparedBytes < byteCount)
+    {
+        const size_t remaining =
+            byteCount - comparedBytes;
+
+        const size_t chunkSize =
+            remaining < sizeof(comparisonBuffer)
+            ? remaining
+            : sizeof(comparisonBuffer);
+
+        const size_t bytesRead =
+            fread(
+                comparisonBuffer,
+                1,
+                chunkSize,
+                inputFile);
+
+        if (bytesRead != chunkSize ||
+            memcmp(
+                comparisonBuffer,
+                bytes + comparedBytes,
+                chunkSize) != 0)
+        {
+            matches = FALSE;
+            break;
+        }
+
+        comparedBytes += chunkSize;
+    }
+
+    fclose(inputFile);
+    return matches;
+}
+
+
 static BOOL BuildTexturePath(
     const TCHAR* sourceFilename,
     const TCHAR* roleName,
+    int imageIndex,
     const TCHAR* extension,
     TCHAR* outputPath,
     size_t outputPathCount,
@@ -718,7 +954,7 @@ static BOOL BuildTexturePath(
             _T("%s\\MaxGLB_%s_%d%s"),
             textureDirectory,
             roleName,
-            g_importTextureSetIndex,
+            imageIndex,
             extension) < 0)
     {
         _tcscpy_s(
@@ -851,9 +1087,13 @@ static BOOL ExtractEmbeddedImage(
         return FALSE;
     }
 
+    const int imageIndex =
+        GetStableImportImageIndex(image);
+
     if (!BuildTexturePath(
             sourceFilename,
             roleName,
+            imageIndex,
             extension,
             outputPath,
             outputPathCount,
@@ -862,6 +1102,17 @@ static BOOL ExtractEmbeddedImage(
     {
         return FALSE;
     }
+
+    if (ExistingFileMatchesBytes(
+            outputPath,
+            imageBytes,
+            imageByteCount))
+    {
+        g_unchangedImagesThisImport[image] = TRUE;
+        return TRUE;
+    }
+
+    g_unchangedImagesThisImport[image] = FALSE;
 
     FILE* outputFile = NULL;
 
@@ -1107,9 +1358,13 @@ static BOOL SplitOrmTexture(
         return FALSE;
     }
 
+    const int imageIndex =
+        GetStableImportImageIndex(image);
+
     if (!BuildTexturePath(
             sourceFilename,
             _T("Occlusion"),
+            imageIndex,
             _T(".png"),
             outOcclusionPath,
             outOcclusionPathCount,
@@ -1118,6 +1373,7 @@ static BOOL SplitOrmTexture(
         !BuildTexturePath(
             sourceFilename,
             _T("Glossiness"),
+            imageIndex,
             _T(".png"),
             outGlossinessPath,
             outGlossinessPathCount,
@@ -1126,6 +1382,7 @@ static BOOL SplitOrmTexture(
         !BuildTexturePath(
             sourceFilename,
             _T("Metallic"),
+            imageIndex,
             _T(".png"),
             outMetallicPath,
             outMetallicPathCount,
@@ -1133,6 +1390,26 @@ static BOOL SplitOrmTexture(
             errorMessageCount))
     {
         return FALSE;
+    }
+
+    const BOOL alreadySplitThisImport =
+        g_splitOrmImagesThisImport.find(image) !=
+            g_splitOrmImagesThisImport.end();
+
+    const std::map<const cgltf_image*, BOOL>::const_iterator unchangedIterator =
+        g_unchangedImagesThisImport.find(image);
+
+    const BOOL sourceWasUnchanged =
+        unchangedIterator != g_unchangedImagesThisImport.end() &&
+        unchangedIterator->second;
+
+    if ((alreadySplitThisImport || sourceWasUnchanged) &&
+        ImportTextureFileExists(outOcclusionPath) &&
+        ImportTextureFileExists(outGlossinessPath) &&
+        ImportTextureFileExists(outMetallicPath))
+    {
+        g_splitOrmImagesThisImport[image] = TRUE;
+        return TRUE;
     }
 
     HRESULT comResult =
@@ -1377,6 +1654,7 @@ static BOOL SplitOrmTexture(
         return FALSE;
     }
 
+    g_splitOrmImagesThisImport[image] = TRUE;
     return TRUE;
 }
 
@@ -1628,6 +1906,8 @@ static BOOL CreateStandardMaterialForPrimitive(
     BOOL hasOrmChannels = FALSE;
     BOOL hasEmissiveTexture = FALSE;
 
+    if (g_activeImportSettings.importTextures)
+    {
     if (gltfMaterial->has_pbr_metallic_roughness)
     {
         const cgltf_texture_view& baseColorView =
@@ -1943,6 +2223,8 @@ static BOOL CreateStandardMaterialForPrimitive(
         AppendMaterialImportLog(_T("09: emissive assigned"));
     }
 
+    }
+
     AppendMaterialImportLog(_T("10: material graph complete"));
 
     maxMaterial->NotifyDependents(
@@ -1999,6 +2281,9 @@ struct MaxGLBImportStats
     int ormTextures;
     int emissiveTextures;
     int nextObjectIndex;
+    BOOL createdParentNode;
+
+    std::vector<INode*> createdNodes;
 
     MaxGLBImportStats()
         : objectCount(0)
@@ -2013,6 +2298,7 @@ struct MaxGLBImportStats
         , ormTextures(0)
         , emissiveTextures(0)
         , nextObjectIndex(0)
+        , createdParentNode(FALSE)
     {
     }
 };
@@ -2055,6 +2341,4229 @@ static void ConvertUtf8ToTchar(
         utf8Text,
         _TRUNCATE);
 #endif
+}
+
+
+
+#define MAXGLB_ID_ROTATION_COMBO       4101
+#define MAXGLB_ID_CUSTOM_ROTATION      4102
+#define MAXGLB_ID_IMPORT_TEXTURES      4103
+#define MAXGLB_ID_ADD_PARENT           4104
+#define MAXGLB_ID_IMPORT_ANIMATION     4105
+#define MAXGLB_ID_INFO                 4106
+#define MAXGLB_ID_IMPORT               4107
+#define MAXGLB_ID_CANCEL               4108
+#define MAXGLB_ID_OBJECT_LIST          4109
+#define MAXGLB_ID_MATERIAL_LIST        4110
+#define MAXGLB_ID_TEXTURE_LIST         4111
+#define MAXGLB_ID_NORMALIZE_SIZE       4112
+#define MAXGLB_ID_NORMALIZE_TARGET     4113
+
+
+#define MAXGLB_ID_EXPORT_SCALE             4201
+#define MAXGLB_ID_EXPORT_NORMALIZE         4202
+#define MAXGLB_ID_EXPORT_NORMALIZE_TARGET  4203
+#define MAXGLB_ID_EXPORT_MATERIALS         4204
+#define MAXGLB_ID_EXPORT_TEXTURES          4205
+#define MAXGLB_ID_EXPORT_SUMMARY           4206
+#define MAXGLB_ID_EXPORT_EXPLORER          4207
+#define MAXGLB_ID_EXPORT_ANIMATION         4208
+#define MAXGLB_ID_EXPORT_INFO              4209
+#define MAXGLB_ID_EXPORT_CANCEL            4210
+#define MAXGLB_ID_EXPORT_CONFIRM           4211
+
+
+struct MaxGLBImportDialogContext
+{
+    HWND parentWindow;
+    HWND window;
+    HWND previewWindow;
+    HWND rotationCombo;
+    HWND customRotationEdit;
+    HWND importTexturesCheck;
+    HWND addParentCheck;
+    HWND normalizeSizeCheck;
+    HWND normalizeTargetEdit;
+    HWND animationCheck;
+
+    const cgltf_data* data;
+    const TCHAR* filename;
+
+    MaxGLBImportSettings settings;
+
+    BOOL accepted;
+    BOOL closed;
+    int importableObjectCount;
+
+    std::vector<Point3> previewPoints;
+
+    MaxGLBImportDialogContext()
+        : parentWindow(NULL)
+        , window(NULL)
+        , previewWindow(NULL)
+        , rotationCombo(NULL)
+        , customRotationEdit(NULL)
+        , importTexturesCheck(NULL)
+        , addParentCheck(NULL)
+        , normalizeSizeCheck(NULL)
+        , normalizeTargetEdit(NULL)
+        , animationCheck(NULL)
+        , data(NULL)
+        , filename(NULL)
+        , accepted(FALSE)
+        , closed(FALSE)
+        , importableObjectCount(0)
+    {
+    }
+};
+
+
+static const TCHAR* MAXGLB_IMPORT_WINDOW_CLASS =
+    _T("MaxGLB2016ImportOptionsWindow");
+
+static const TCHAR* MAXGLB_PREVIEW_WINDOW_CLASS =
+    _T("MaxGLB2016PreviewWindow");
+
+
+static void UseReadableClassicTheme(
+    HWND control)
+{
+    if (control != NULL)
+    {
+        // 3ds Max 2016 may apply its dark UI theme to controls created by
+        // plug-ins, while the dialog itself remains light. Disabling the
+        // visual style on form fields gives us predictable high contrast.
+        SetWindowTheme(
+            control,
+            L"",
+            L"");
+    }
+}
+
+
+static BOOL GetImportCheckboxState(
+    HWND control)
+{
+    return control != NULL &&
+        GetWindowLongPtr(
+            control,
+            GWLP_USERDATA) != 0;
+}
+
+
+static void SetImportCheckboxState(
+    HWND control,
+    BOOL checked)
+{
+    if (control == NULL)
+    {
+        return;
+    }
+
+    SetWindowLongPtr(
+        control,
+        GWLP_USERDATA,
+        checked ? 1 : 0);
+
+    InvalidateRect(
+        control,
+        NULL,
+        TRUE);
+}
+
+
+static BOOL IsImportCheckboxId(
+    int controlId)
+{
+    return controlId == MAXGLB_ID_IMPORT_TEXTURES ||
+        controlId == MAXGLB_ID_ADD_PARENT ||
+        controlId == MAXGLB_ID_NORMALIZE_SIZE ||
+        controlId == MAXGLB_ID_IMPORT_ANIMATION;
+}
+
+
+static BOOL IsImportPushButtonId(
+    int controlId)
+{
+    return controlId == MAXGLB_ID_INFO ||
+        controlId == MAXGLB_ID_CANCEL ||
+        controlId == MAXGLB_ID_IMPORT;
+}
+
+
+static void DrawLightImportCheckbox(
+    const DRAWITEMSTRUCT* drawItem)
+{
+    if (drawItem == NULL)
+    {
+        return;
+    }
+
+    HDC deviceContext =
+        drawItem->hDC;
+
+    RECT itemRect =
+        drawItem->rcItem;
+
+    const BOOL disabled =
+        (drawItem->itemState & ODS_DISABLED) != 0;
+
+    const BOOL pressed =
+        (drawItem->itemState & ODS_SELECTED) != 0;
+
+    const BOOL focused =
+        (drawItem->itemState & ODS_FOCUS) != 0;
+
+    const BOOL checked =
+        GetImportCheckboxState(
+            drawItem->hwndItem);
+
+    const COLORREF backgroundColor =
+        GetSysColor(COLOR_BTNFACE);
+
+    HBRUSH backgroundBrush =
+        CreateSolidBrush(backgroundColor);
+
+    FillRect(
+        deviceContext,
+        &itemRect,
+        backgroundBrush);
+
+    DeleteObject(backgroundBrush);
+
+    RECT boxRect;
+    boxRect.left = itemRect.left + 3;
+    boxRect.top =
+        itemRect.top +
+        ((itemRect.bottom - itemRect.top - 15) / 2);
+    boxRect.right = boxRect.left + 15;
+    boxRect.bottom = boxRect.top + 15;
+
+    HBRUSH boxBrush =
+        CreateSolidBrush(
+            disabled
+                ? RGB(238, 238, 238)
+                : RGB(255, 255, 255));
+
+    FillRect(
+        deviceContext,
+        &boxRect,
+        boxBrush);
+
+    DeleteObject(boxBrush);
+
+    HPEN borderPen =
+        CreatePen(
+            PS_SOLID,
+            1,
+            disabled
+                ? RGB(145, 145, 145)
+                : RGB(70, 70, 70));
+
+    HPEN oldPen =
+        reinterpret_cast<HPEN>(
+            SelectObject(
+                deviceContext,
+                borderPen));
+
+    HBRUSH oldBrush =
+        reinterpret_cast<HBRUSH>(
+            SelectObject(
+                deviceContext,
+                GetStockObject(NULL_BRUSH)));
+
+    Rectangle(
+        deviceContext,
+        boxRect.left,
+        boxRect.top,
+        boxRect.right,
+        boxRect.bottom);
+
+    if (checked)
+    {
+        HPEN checkPen =
+            CreatePen(
+                PS_SOLID,
+                2,
+                disabled
+                    ? RGB(135, 135, 135)
+                    : RGB(20, 20, 20));
+
+        SelectObject(
+            deviceContext,
+            checkPen);
+
+        const int offset =
+            pressed ? 1 : 0;
+
+        MoveToEx(
+            deviceContext,
+            boxRect.left + 3 + offset,
+            boxRect.top + 7 + offset,
+            NULL);
+
+        LineTo(
+            deviceContext,
+            boxRect.left + 6 + offset,
+            boxRect.top + 11 + offset);
+
+        LineTo(
+            deviceContext,
+            boxRect.left + 12 + offset,
+            boxRect.top + 3 + offset);
+
+        SelectObject(
+            deviceContext,
+            borderPen);
+
+        DeleteObject(checkPen);
+    }
+
+    SelectObject(
+        deviceContext,
+        oldBrush);
+
+    SelectObject(
+        deviceContext,
+        oldPen);
+
+    DeleteObject(borderPen);
+
+    TCHAR caption[256];
+    caption[0] = _T('\0');
+
+    GetWindowText(
+        drawItem->hwndItem,
+        caption,
+        _countof(caption));
+
+    RECT textRect =
+        itemRect;
+
+    textRect.left =
+        boxRect.right + 7;
+
+    SetBkMode(
+        deviceContext,
+        TRANSPARENT);
+
+    SetTextColor(
+        deviceContext,
+        disabled
+            ? GetSysColor(COLOR_GRAYTEXT)
+            : RGB(20, 20, 20));
+
+    DrawText(
+        deviceContext,
+        caption,
+        -1,
+        &textRect,
+        DT_LEFT |
+        DT_VCENTER |
+        DT_SINGLELINE |
+        DT_END_ELLIPSIS);
+
+    if (focused &&
+        !disabled)
+    {
+        RECT focusRect =
+            textRect;
+
+        focusRect.right -= 2;
+        focusRect.top += 2;
+        focusRect.bottom -= 2;
+
+        DrawFocusRect(
+            deviceContext,
+            &focusRect);
+    }
+}
+
+
+static void DrawLightImportPushButton(
+    const DRAWITEMSTRUCT* drawItem)
+{
+    if (drawItem == NULL)
+    {
+        return;
+    }
+
+    HDC deviceContext =
+        drawItem->hDC;
+
+    RECT itemRect =
+        drawItem->rcItem;
+
+    const BOOL disabled =
+        (drawItem->itemState & ODS_DISABLED) != 0;
+
+    const BOOL pressed =
+        (drawItem->itemState & ODS_SELECTED) != 0;
+
+    const BOOL focused =
+        (drawItem->itemState & ODS_FOCUS) != 0;
+
+    const int controlId =
+        GetDlgCtrlID(
+            drawItem->hwndItem);
+
+    const BOOL defaultButton =
+        controlId == MAXGLB_ID_IMPORT ||
+        controlId == MAXGLB_ID_EXPORT_CONFIRM;
+
+    HBRUSH faceBrush =
+        CreateSolidBrush(
+            pressed
+                ? RGB(218, 218, 218)
+                : RGB(245, 245, 245));
+
+    FillRect(
+        deviceContext,
+        &itemRect,
+        faceBrush);
+
+    DeleteObject(faceBrush);
+
+    HPEN borderPen =
+        CreatePen(
+            PS_SOLID,
+            defaultButton ? 2 : 1,
+            disabled
+                ? RGB(155, 155, 155)
+                : RGB(65, 65, 65));
+
+    HPEN oldPen =
+        reinterpret_cast<HPEN>(
+            SelectObject(
+                deviceContext,
+                borderPen));
+
+    HBRUSH oldBrush =
+        reinterpret_cast<HBRUSH>(
+            SelectObject(
+                deviceContext,
+                GetStockObject(NULL_BRUSH)));
+
+    Rectangle(
+        deviceContext,
+        itemRect.left,
+        itemRect.top,
+        itemRect.right,
+        itemRect.bottom);
+
+    SelectObject(
+        deviceContext,
+        oldBrush);
+
+    SelectObject(
+        deviceContext,
+        oldPen);
+
+    DeleteObject(borderPen);
+
+    TCHAR caption[128];
+    caption[0] = _T('\0');
+
+    GetWindowText(
+        drawItem->hwndItem,
+        caption,
+        _countof(caption));
+
+    RECT textRect =
+        itemRect;
+
+    if (pressed)
+    {
+        ++textRect.left;
+        ++textRect.top;
+        ++textRect.right;
+        ++textRect.bottom;
+    }
+
+    SetBkMode(
+        deviceContext,
+        TRANSPARENT);
+
+    SetTextColor(
+        deviceContext,
+        disabled
+            ? GetSysColor(COLOR_GRAYTEXT)
+            : RGB(20, 20, 20));
+
+    DrawText(
+        deviceContext,
+        caption,
+        -1,
+        &textRect,
+        DT_CENTER |
+        DT_VCENTER |
+        DT_SINGLELINE);
+
+    if (focused &&
+        !disabled)
+    {
+        RECT focusRect =
+            itemRect;
+
+        InflateRect(
+            &focusRect,
+            -4,
+            -4);
+
+        DrawFocusRect(
+            deviceContext,
+            &focusRect);
+    }
+}
+
+
+static void SetImportControlFont(
+    HWND control)
+{
+    if (control != NULL)
+    {
+        SendMessage(
+            control,
+            WM_SETFONT,
+            reinterpret_cast<WPARAM>(
+                GetStockObject(DEFAULT_GUI_FONT)),
+            TRUE);
+    }
+}
+
+
+static HWND CreateImportControl(
+    DWORD extendedStyle,
+    const TCHAR* className,
+    const TCHAR* text,
+    DWORD style,
+    int x,
+    int y,
+    int width,
+    int height,
+    HWND parent,
+    int controlId,
+    LPVOID createParameter)
+{
+    HWND control =
+        CreateWindowEx(
+            extendedStyle,
+            className,
+            text,
+            style,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(controlId)),
+            hInstance,
+            createParameter);
+
+    SetImportControlFont(control);
+    return control;
+}
+
+
+static int CountImportablePrimitivesRecursive(
+    const cgltf_node* node)
+{
+    if (node == NULL)
+    {
+        return 0;
+    }
+
+    int count = 0;
+
+    if (node->mesh != NULL)
+    {
+        for (cgltf_size primitiveIndex = 0;
+             primitiveIndex < node->mesh->primitives_count;
+             ++primitiveIndex)
+        {
+            const cgltf_primitive* primitive =
+                &node->mesh->primitives[primitiveIndex];
+
+            const cgltf_accessor* positions =
+                cgltf_find_accessor(
+                    primitive,
+                    cgltf_attribute_type_position,
+                    0);
+
+            if (primitive->type == cgltf_primitive_type_triangles &&
+                positions != NULL &&
+                positions->count > 0)
+            {
+                ++count;
+            }
+        }
+    }
+
+    for (cgltf_size childIndex = 0;
+         childIndex < node->children_count;
+         ++childIndex)
+    {
+        count +=
+            CountImportablePrimitivesRecursive(
+                node->children[childIndex]);
+    }
+
+    return count;
+}
+
+
+static int CountImportableScenePrimitives(
+    const cgltf_data* data)
+{
+    if (data == NULL)
+    {
+        return 0;
+    }
+
+    int count = 0;
+
+    const cgltf_scene* activeScene =
+        data->scene;
+
+    if (activeScene == NULL &&
+        data->scenes_count > 0)
+    {
+        activeScene =
+            &data->scenes[0];
+    }
+
+    if (activeScene != NULL &&
+        activeScene->nodes_count > 0)
+    {
+        for (cgltf_size rootIndex = 0;
+             rootIndex < activeScene->nodes_count;
+             ++rootIndex)
+        {
+            count +=
+                CountImportablePrimitivesRecursive(
+                    activeScene->nodes[rootIndex]);
+        }
+    }
+    else
+    {
+        for (cgltf_size nodeIndex = 0;
+             nodeIndex < data->nodes_count;
+             ++nodeIndex)
+        {
+            const cgltf_node* node =
+                &data->nodes[nodeIndex];
+
+            if (FindParentNode(data, node) == NULL)
+            {
+                count +=
+                    CountImportablePrimitivesRecursive(
+                        node);
+            }
+        }
+    }
+
+    return count;
+}
+
+
+static void AddNodeTreeLinesRecursive(
+    HWND listBox,
+    const cgltf_node* node,
+    int depth)
+{
+    if (listBox == NULL ||
+        node == NULL)
+    {
+        return;
+    }
+
+    TCHAR nodeName[256];
+    ConvertUtf8ToTchar(
+        node->name,
+        nodeName,
+        _countof(nodeName));
+
+    if (nodeName[0] == _T('\0'))
+    {
+        _tcscpy_s(
+            nodeName,
+            _countof(nodeName),
+            _T("(unnamed node)"));
+    }
+
+    TCHAR indentation[64];
+    indentation[0] = _T('\0');
+
+    const int indentationCount =
+        depth < 15
+        ? depth
+        : 15;
+
+    for (int indentationIndex = 0;
+         indentationIndex < indentationCount;
+         ++indentationIndex)
+    {
+        _tcscat_s(
+            indentation,
+            _countof(indentation),
+            _T("  "));
+    }
+
+    TCHAR line[384];
+
+    if (node->mesh != NULL)
+    {
+        _stprintf_s(
+            line,
+            _countof(line),
+            _T("%s%s  [mesh: %u primitive%s]"),
+            indentation,
+            nodeName,
+            static_cast<unsigned int>(
+                node->mesh->primitives_count),
+            node->mesh->primitives_count == 1
+                ? _T("")
+                : _T("s"));
+    }
+    else
+    {
+        _stprintf_s(
+            line,
+            _countof(line),
+            _T("%s%s"),
+            indentation,
+            nodeName);
+    }
+
+    SendMessage(
+        listBox,
+        LB_ADDSTRING,
+        0,
+        reinterpret_cast<LPARAM>(line));
+
+    for (cgltf_size childIndex = 0;
+         childIndex < node->children_count;
+         ++childIndex)
+    {
+        AddNodeTreeLinesRecursive(
+            listBox,
+            node->children[childIndex],
+            depth + 1);
+    }
+}
+
+
+static void PopulateObjectTreeList(
+    HWND listBox,
+    const cgltf_data* data)
+{
+    if (listBox == NULL ||
+        data == NULL)
+    {
+        return;
+    }
+
+    const cgltf_scene* activeScene =
+        data->scene;
+
+    if (activeScene == NULL &&
+        data->scenes_count > 0)
+    {
+        activeScene =
+            &data->scenes[0];
+    }
+
+    if (activeScene != NULL &&
+        activeScene->nodes_count > 0)
+    {
+        for (cgltf_size rootIndex = 0;
+             rootIndex < activeScene->nodes_count;
+             ++rootIndex)
+        {
+            AddNodeTreeLinesRecursive(
+                listBox,
+                activeScene->nodes[rootIndex],
+                0);
+        }
+    }
+    else
+    {
+        for (cgltf_size nodeIndex = 0;
+             nodeIndex < data->nodes_count;
+             ++nodeIndex)
+        {
+            const cgltf_node* node =
+                &data->nodes[nodeIndex];
+
+            if (FindParentNode(data, node) == NULL)
+            {
+                AddNodeTreeLinesRecursive(
+                    listBox,
+                    node,
+                    0);
+            }
+        }
+    }
+}
+
+
+static void PopulateMaterialList(
+    HWND listBox,
+    const cgltf_data* data)
+{
+    if (listBox == NULL ||
+        data == NULL)
+    {
+        return;
+    }
+
+    if (data->materials_count == 0)
+    {
+        SendMessage(
+            listBox,
+            LB_ADDSTRING,
+            0,
+            reinterpret_cast<LPARAM>(
+                _T("(no materials)")));
+        return;
+    }
+
+    for (cgltf_size materialIndex = 0;
+         materialIndex < data->materials_count;
+         ++materialIndex)
+    {
+        TCHAR materialName[256];
+        ConvertUtf8ToTchar(
+            data->materials[materialIndex].name,
+            materialName,
+            _countof(materialName));
+
+        if (materialName[0] == _T('\0'))
+        {
+            _stprintf_s(
+                materialName,
+                _countof(materialName),
+                _T("Material %u"),
+                static_cast<unsigned int>(
+                    materialIndex));
+        }
+
+        SendMessage(
+            listBox,
+            LB_ADDSTRING,
+            0,
+            reinterpret_cast<LPARAM>(
+                materialName));
+    }
+}
+
+
+static void PopulateTextureList(
+    HWND listBox,
+    const cgltf_data* data)
+{
+    if (listBox == NULL ||
+        data == NULL)
+    {
+        return;
+    }
+
+    if (data->images_count == 0)
+    {
+        SendMessage(
+            listBox,
+            LB_ADDSTRING,
+            0,
+            reinterpret_cast<LPARAM>(
+                _T("(no textures)")));
+        return;
+    }
+
+    for (cgltf_size imageIndex = 0;
+         imageIndex < data->images_count;
+         ++imageIndex)
+    {
+        const cgltf_image& image =
+            data->images[imageIndex];
+
+        TCHAR imageName[256];
+        ConvertUtf8ToTchar(
+            image.name,
+            imageName,
+            _countof(imageName));
+
+        if (imageName[0] == _T('\0'))
+        {
+            ConvertUtf8ToTchar(
+                image.uri,
+                imageName,
+                _countof(imageName));
+        }
+
+        if (imageName[0] == _T('\0'))
+        {
+            _stprintf_s(
+                imageName,
+                _countof(imageName),
+                _T("Embedded image %u"),
+                static_cast<unsigned int>(
+                    imageIndex));
+        }
+
+        SendMessage(
+            listBox,
+            LB_ADDSTRING,
+            0,
+            reinterpret_cast<LPARAM>(
+                imageName));
+    }
+}
+
+
+static void CollectPreviewPointsFromNode(
+    const cgltf_data* data,
+    const cgltf_node* node,
+    std::vector<Point3>& outputPoints,
+    size_t maximumPointCount)
+{
+    if (data == NULL ||
+        node == NULL ||
+        outputPoints.size() >= maximumPointCount)
+    {
+        return;
+    }
+
+    if (node->mesh != NULL)
+    {
+        cgltf_float worldMatrix[16];
+        BuildGltfWorldMatrix(
+            data,
+            node,
+            worldMatrix);
+
+        for (cgltf_size primitiveIndex = 0;
+             primitiveIndex < node->mesh->primitives_count &&
+             outputPoints.size() < maximumPointCount;
+             ++primitiveIndex)
+        {
+            const cgltf_primitive* primitive =
+                &node->mesh->primitives[primitiveIndex];
+
+            if (primitive->type !=
+                cgltf_primitive_type_triangles)
+            {
+                continue;
+            }
+
+            const cgltf_accessor* positions =
+                cgltf_find_accessor(
+                    primitive,
+                    cgltf_attribute_type_position,
+                    0);
+
+            if (positions == NULL ||
+                positions->count == 0)
+            {
+                continue;
+            }
+
+            cgltf_size sampleStep = 1;
+
+            const size_t remainingCapacity =
+                maximumPointCount -
+                outputPoints.size();
+
+            if (positions->count > remainingCapacity &&
+                remainingCapacity > 0)
+            {
+                sampleStep =
+                    positions->count /
+                    remainingCapacity;
+
+                if (sampleStep < 1)
+                {
+                    sampleStep = 1;
+                }
+            }
+
+            for (cgltf_size vertexIndex = 0;
+                 vertexIndex < positions->count &&
+                 outputPoints.size() < maximumPointCount;
+                 vertexIndex += sampleStep)
+            {
+                cgltf_float localPosition[3];
+
+                if (!cgltf_accessor_read_float(
+                        positions,
+                        vertexIndex,
+                        localPosition,
+                        3))
+                {
+                    continue;
+                }
+
+                cgltf_float worldPosition[3];
+
+                TransformGltfPoint(
+                    worldMatrix,
+                    localPosition[0],
+                    localPosition[1],
+                    localPosition[2],
+                    worldPosition);
+
+                outputPoints.push_back(
+                    ConvertGltfPositionToMax(
+                        worldPosition,
+                        0.0f));
+            }
+        }
+    }
+
+    for (cgltf_size childIndex = 0;
+         childIndex < node->children_count &&
+         outputPoints.size() < maximumPointCount;
+         ++childIndex)
+    {
+        CollectPreviewPointsFromNode(
+            data,
+            node->children[childIndex],
+            outputPoints,
+            maximumPointCount);
+    }
+}
+
+
+static void CollectScenePreviewPoints(
+    const cgltf_data* data,
+    std::vector<Point3>& outputPoints)
+{
+    outputPoints.clear();
+
+    if (data == NULL)
+    {
+        return;
+    }
+
+    const size_t maximumPointCount =
+        12000;
+
+    const cgltf_scene* activeScene =
+        data->scene;
+
+    if (activeScene == NULL &&
+        data->scenes_count > 0)
+    {
+        activeScene =
+            &data->scenes[0];
+    }
+
+    if (activeScene != NULL &&
+        activeScene->nodes_count > 0)
+    {
+        for (cgltf_size rootIndex = 0;
+             rootIndex < activeScene->nodes_count &&
+             outputPoints.size() < maximumPointCount;
+             ++rootIndex)
+        {
+            CollectPreviewPointsFromNode(
+                data,
+                activeScene->nodes[rootIndex],
+                outputPoints,
+                maximumPointCount);
+        }
+    }
+    else
+    {
+        for (cgltf_size nodeIndex = 0;
+             nodeIndex < data->nodes_count &&
+             outputPoints.size() < maximumPointCount;
+             ++nodeIndex)
+        {
+            const cgltf_node* node =
+                &data->nodes[nodeIndex];
+
+            if (FindParentNode(data, node) == NULL)
+            {
+                CollectPreviewPointsFromNode(
+                    data,
+                    node,
+                    outputPoints,
+                    maximumPointCount);
+            }
+        }
+    }
+}
+
+
+static void ExpandImportBoundsFromNode(
+    const cgltf_data* data,
+    const cgltf_node* node,
+    float correctionXDegrees,
+    Point3* minimum,
+    Point3* maximum,
+    BOOL* hasBounds)
+{
+    if (data == NULL ||
+        node == NULL ||
+        minimum == NULL ||
+        maximum == NULL ||
+        hasBounds == NULL)
+    {
+        return;
+    }
+
+    cgltf_float worldMatrix[16];
+    BuildGltfWorldMatrix(
+        data,
+        node,
+        worldMatrix);
+
+    if (node->mesh != NULL)
+    {
+        for (cgltf_size primitiveIndex = 0;
+             primitiveIndex < node->mesh->primitives_count;
+             ++primitiveIndex)
+        {
+            const cgltf_primitive* primitive =
+                &node->mesh->primitives[primitiveIndex];
+
+            if (primitive->type !=
+                cgltf_primitive_type_triangles)
+            {
+                continue;
+            }
+
+            const cgltf_accessor* positions =
+                cgltf_find_accessor(
+                    primitive,
+                    cgltf_attribute_type_position,
+                    0);
+
+            if (positions == NULL)
+            {
+                continue;
+            }
+
+            for (cgltf_size vertexIndex = 0;
+                 vertexIndex < positions->count;
+                 ++vertexIndex)
+            {
+                cgltf_float localPosition[3];
+
+                if (!cgltf_accessor_read_float(
+                        positions,
+                        vertexIndex,
+                        localPosition,
+                        3))
+                {
+                    continue;
+                }
+
+                cgltf_float worldPosition[3];
+
+                TransformGltfPoint(
+                    worldMatrix,
+                    localPosition[0],
+                    localPosition[1],
+                    localPosition[2],
+                    worldPosition);
+
+                const Point3 converted =
+                    ConvertGltfPositionToMax(
+                        worldPosition,
+                        correctionXDegrees);
+
+                if (!*hasBounds)
+                {
+                    *minimum = converted;
+                    *maximum = converted;
+                    *hasBounds = TRUE;
+                }
+                else
+                {
+                    minimum->x =
+                        converted.x < minimum->x
+                        ? converted.x
+                        : minimum->x;
+
+                    minimum->y =
+                        converted.y < minimum->y
+                        ? converted.y
+                        : minimum->y;
+
+                    minimum->z =
+                        converted.z < minimum->z
+                        ? converted.z
+                        : minimum->z;
+
+                    maximum->x =
+                        converted.x > maximum->x
+                        ? converted.x
+                        : maximum->x;
+
+                    maximum->y =
+                        converted.y > maximum->y
+                        ? converted.y
+                        : maximum->y;
+
+                    maximum->z =
+                        converted.z > maximum->z
+                        ? converted.z
+                        : maximum->z;
+                }
+            }
+        }
+    }
+
+    for (cgltf_size childIndex = 0;
+         childIndex < node->children_count;
+         ++childIndex)
+    {
+        ExpandImportBoundsFromNode(
+            data,
+            node->children[childIndex],
+            correctionXDegrees,
+            minimum,
+            maximum,
+            hasBounds);
+    }
+}
+
+
+static BOOL ComputeNormalizedImportScale(
+    const cgltf_data* data,
+    float correctionXDegrees,
+    float targetSize,
+    float* outputScale)
+{
+    if (data == NULL ||
+        outputScale == NULL ||
+        targetSize <= 0.0f)
+    {
+        return FALSE;
+    }
+
+    Point3 minimum(0.0f, 0.0f, 0.0f);
+    Point3 maximum(0.0f, 0.0f, 0.0f);
+    BOOL hasBounds = FALSE;
+
+    const cgltf_scene* activeScene =
+        data->scene;
+
+    if (activeScene == NULL &&
+        data->scenes_count > 0)
+    {
+        activeScene =
+            &data->scenes[0];
+    }
+
+    if (activeScene != NULL &&
+        activeScene->nodes_count > 0)
+    {
+        for (cgltf_size rootIndex = 0;
+             rootIndex < activeScene->nodes_count;
+             ++rootIndex)
+        {
+            ExpandImportBoundsFromNode(
+                data,
+                activeScene->nodes[rootIndex],
+                correctionXDegrees,
+                &minimum,
+                &maximum,
+                &hasBounds);
+        }
+    }
+    else
+    {
+        for (cgltf_size nodeIndex = 0;
+             nodeIndex < data->nodes_count;
+             ++nodeIndex)
+        {
+            const cgltf_node* node =
+                &data->nodes[nodeIndex];
+
+            if (FindParentNode(data, node) == NULL)
+            {
+                ExpandImportBoundsFromNode(
+                    data,
+                    node,
+                    correctionXDegrees,
+                    &minimum,
+                    &maximum,
+                    &hasBounds);
+            }
+        }
+    }
+
+    if (!hasBounds)
+    {
+        return FALSE;
+    }
+
+    const float extentX =
+        maximum.x - minimum.x;
+
+    const float extentY =
+        maximum.y - minimum.y;
+
+    const float extentZ =
+        maximum.z - minimum.z;
+
+    float largestExtent = extentX;
+
+    if (extentY > largestExtent)
+    {
+        largestExtent = extentY;
+    }
+
+    if (extentZ > largestExtent)
+    {
+        largestExtent = extentZ;
+    }
+
+    if (largestExtent <= 1.0e-20f)
+    {
+        return FALSE;
+    }
+
+    *outputScale =
+        targetSize /
+        largestExtent;
+
+    return *outputScale > 0.0f &&
+        *outputScale == *outputScale;
+}
+
+
+static void DrawImportPreview(
+    HWND window,
+    HDC deviceContext,
+    const MaxGLBImportDialogContext* context)
+{
+    RECT clientRect;
+    GetClientRect(
+        window,
+        &clientRect);
+
+    HBRUSH backgroundBrush =
+        CreateSolidBrush(
+            RGB(38, 42, 48));
+
+    FillRect(
+        deviceContext,
+        &clientRect,
+        backgroundBrush);
+
+    DeleteObject(backgroundBrush);
+
+    FrameRect(
+        deviceContext,
+        &clientRect,
+        reinterpret_cast<HBRUSH>(
+            GetStockObject(GRAY_BRUSH)));
+
+    if (context == NULL ||
+        context->previewPoints.empty())
+    {
+        SetBkMode(
+            deviceContext,
+            TRANSPARENT);
+
+        SetTextColor(
+            deviceContext,
+            RGB(220, 220, 220));
+
+        DrawText(
+            deviceContext,
+            _T("No geometry preview"),
+            -1,
+            &clientRect,
+            DT_CENTER |
+            DT_VCENTER |
+            DT_SINGLELINE);
+
+        return;
+    }
+
+    float minimumX = FLT_MAX;
+    float minimumY = FLT_MAX;
+    float maximumX = -FLT_MAX;
+    float maximumY = -FLT_MAX;
+
+    std::vector<Point2> projectedPoints;
+    projectedPoints.reserve(
+        context->previewPoints.size());
+
+    for (size_t pointIndex = 0;
+         pointIndex < context->previewPoints.size();
+         ++pointIndex)
+    {
+        const Point3 corrected =
+            RotateMaxSceneAroundX(
+                context->previewPoints[pointIndex],
+                context->settings.rotationXDegrees);
+
+        // True 3ds Max Front view: X runs horizontally and Z vertically.
+        // We look along the negative Y axis. This makes "up" unambiguous
+        // when choosing an additional X-axis correction.
+        const float projectedX =
+            corrected.x;
+
+        const float projectedY =
+            corrected.z;
+
+        projectedPoints.push_back(
+            Point2(projectedX, projectedY));
+
+        if (projectedX < minimumX)
+        {
+            minimumX = projectedX;
+        }
+
+        if (projectedX > maximumX)
+        {
+            maximumX = projectedX;
+        }
+
+        if (projectedY < minimumY)
+        {
+            minimumY = projectedY;
+        }
+
+        if (projectedY > maximumY)
+        {
+            maximumY = projectedY;
+        }
+    }
+
+    const float rangeX =
+        maximumX - minimumX;
+
+    const float rangeY =
+        maximumY - minimumY;
+
+    const int clientWidth =
+        clientRect.right - clientRect.left;
+
+    const int clientHeight =
+        clientRect.bottom - clientRect.top;
+
+    const float availableWidth =
+        static_cast<float>(clientWidth - 14);
+
+    const float availableHeight =
+        static_cast<float>(clientHeight - 38);
+
+    float scale = 1.0f;
+
+    if (rangeX > 1.0e-6f ||
+        rangeY > 1.0e-6f)
+    {
+        const float scaleX =
+            rangeX > 1.0e-6f
+            ? availableWidth / rangeX
+            : FLT_MAX;
+
+        const float scaleY =
+            rangeY > 1.0e-6f
+            ? availableHeight / rangeY
+            : FLT_MAX;
+
+        scale =
+            scaleX < scaleY
+            ? scaleX
+            : scaleY;
+    }
+
+    const float centerX =
+        (minimumX + maximumX) * 0.5f;
+
+    const float centerY =
+        (minimumY + maximumY) * 0.5f;
+
+    const COLORREF pointColor =
+        RGB(225, 231, 238);
+
+    for (size_t pointIndex = 0;
+         pointIndex < projectedPoints.size();
+         ++pointIndex)
+    {
+        const int screenX =
+            clientWidth / 2 +
+            static_cast<int>(
+                (projectedPoints[pointIndex].x - centerX) *
+                scale);
+
+        const int screenY =
+            (clientHeight - 8) / 2 -
+            static_cast<int>(
+                (projectedPoints[pointIndex].y - centerY) *
+                scale);
+
+        if (screenX > 1 &&
+            screenX < clientWidth - 1 &&
+            screenY > 1 &&
+            screenY < clientHeight - 28)
+        {
+            SetPixelV(
+                deviceContext,
+                screenX,
+                screenY,
+                pointColor);
+
+            if (screenX + 1 < clientWidth - 1)
+            {
+                SetPixelV(
+                    deviceContext,
+                    screenX + 1,
+                    screenY,
+                    pointColor);
+            }
+        }
+    }
+
+    // Small orientation indicator: Max Front view uses X horizontally and
+    // Z vertically. It remains fixed while the model preview rotates.
+    HPEN axisPen =
+        CreatePen(
+            PS_SOLID,
+            1,
+            RGB(126, 205, 126));
+
+    HPEN oldPen =
+        reinterpret_cast<HPEN>(
+            SelectObject(
+                deviceContext,
+                axisPen));
+
+    const int axisOriginX = 13;
+    const int axisOriginY = clientHeight - 34;
+
+    MoveToEx(
+        deviceContext,
+        axisOriginX,
+        axisOriginY,
+        NULL);
+
+    LineTo(
+        deviceContext,
+        axisOriginX,
+        13);
+
+    LineTo(
+        deviceContext,
+        axisOriginX - 3,
+        19);
+
+    MoveToEx(
+        deviceContext,
+        axisOriginX,
+        13,
+        NULL);
+
+    LineTo(
+        deviceContext,
+        axisOriginX + 3,
+        19);
+
+    MoveToEx(
+        deviceContext,
+        axisOriginX,
+        axisOriginY,
+        NULL);
+
+    LineTo(
+        deviceContext,
+        34,
+        axisOriginY);
+
+    LineTo(
+        deviceContext,
+        28,
+        axisOriginY - 3);
+
+    MoveToEx(
+        deviceContext,
+        34,
+        axisOriginY,
+        NULL);
+
+    LineTo(
+        deviceContext,
+        28,
+        axisOriginY + 3);
+
+    SelectObject(
+        deviceContext,
+        oldPen);
+
+    DeleteObject(axisPen);
+
+    SetBkMode(
+        deviceContext,
+        TRANSPARENT);
+
+    SetTextColor(
+        deviceContext,
+        RGB(151, 224, 151));
+
+    RECT zLabelRect;
+    zLabelRect.left = 17;
+    zLabelRect.top = 4;
+    zLabelRect.right = 46;
+    zLabelRect.bottom = 22;
+
+    DrawText(
+        deviceContext,
+        _T("Z+"),
+        -1,
+        &zLabelRect,
+        DT_LEFT |
+        DT_VCENTER |
+        DT_SINGLELINE);
+
+    RECT xLabelRect;
+    xLabelRect.left = 35;
+    xLabelRect.top = axisOriginY - 9;
+    xLabelRect.right = 62;
+    xLabelRect.bottom = axisOriginY + 9;
+
+    DrawText(
+        deviceContext,
+        _T("X+"),
+        -1,
+        &xLabelRect,
+        DT_LEFT |
+        DT_VCENTER |
+        DT_SINGLELINE);
+
+    TCHAR rotationText[96];
+    _stprintf_s(
+        rotationText,
+        _countof(rotationText),
+        _T("Front X/Z  |  X correction: %.1f deg"),
+        context->settings.rotationXDegrees);
+
+    RECT textRect = clientRect;
+    textRect.top =
+        clientRect.bottom - 24;
+
+    SetBkMode(
+        deviceContext,
+        TRANSPARENT);
+
+    SetTextColor(
+        deviceContext,
+        RGB(190, 198, 208));
+
+    DrawText(
+        deviceContext,
+        rotationText,
+        -1,
+        &textRect,
+        DT_CENTER |
+        DT_VCENTER |
+        DT_SINGLELINE);
+}
+
+
+static LRESULT CALLBACK MaxGLBPreviewWindowProcedure(
+    HWND window,
+    UINT message,
+    WPARAM wordParameter,
+    LPARAM longParameter)
+{
+    MaxGLBImportDialogContext* context =
+        reinterpret_cast<MaxGLBImportDialogContext*>(
+            GetWindowLongPtr(
+                window,
+                GWLP_USERDATA));
+
+    if (message == WM_NCCREATE)
+    {
+        CREATESTRUCT* createStruct =
+            reinterpret_cast<CREATESTRUCT*>(
+                longParameter);
+
+        context =
+            reinterpret_cast<MaxGLBImportDialogContext*>(
+                createStruct->lpCreateParams);
+
+        SetWindowLongPtr(
+            window,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(context));
+    }
+
+    switch (message)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        {
+            PAINTSTRUCT paintStruct;
+            HDC deviceContext =
+                BeginPaint(
+                    window,
+                    &paintStruct);
+
+            DrawImportPreview(
+                window,
+                deviceContext,
+                context);
+
+            EndPaint(
+                window,
+                &paintStruct);
+        }
+        return 0;
+    }
+
+    return DefWindowProc(
+        window,
+        message,
+        wordParameter,
+        longParameter);
+}
+
+
+static BOOL TryReadCustomRotation(
+    HWND editControl,
+    float* outputDegrees)
+{
+    if (editControl == NULL ||
+        outputDegrees == NULL)
+    {
+        return FALSE;
+    }
+
+    TCHAR text[64];
+    GetWindowText(
+        editControl,
+        text,
+        _countof(text));
+
+    TCHAR* endPointer = NULL;
+    const double parsedValue =
+        _tcstod(
+            text,
+            &endPointer);
+
+    if (endPointer == text)
+    {
+        return FALSE;
+    }
+
+    while (endPointer != NULL &&
+           (*endPointer == _T(' ') ||
+            *endPointer == _T('\t')))
+    {
+        ++endPointer;
+    }
+
+    if (endPointer == NULL ||
+        *endPointer != _T('\0') ||
+        parsedValue != parsedValue ||
+        parsedValue < -36000.0 ||
+        parsedValue > 36000.0)
+    {
+        return FALSE;
+    }
+
+    *outputDegrees =
+        static_cast<float>(parsedValue);
+
+    return TRUE;
+}
+
+
+static BOOL TryReadPositiveImportSize(
+    HWND editControl,
+    float* outputValue)
+{
+    if (editControl == NULL ||
+        outputValue == NULL)
+    {
+        return FALSE;
+    }
+
+    TCHAR text[64];
+    GetWindowText(
+        editControl,
+        text,
+        _countof(text));
+
+    TCHAR* endPointer = NULL;
+    const double parsedValue =
+        _tcstod(
+            text,
+            &endPointer);
+
+    if (endPointer == text)
+    {
+        return FALSE;
+    }
+
+    while (endPointer != NULL &&
+           (*endPointer == _T(' ') ||
+            *endPointer == _T('\t')))
+    {
+        ++endPointer;
+    }
+
+    if (endPointer == NULL ||
+        *endPointer != _T('\0') ||
+        parsedValue != parsedValue ||
+        parsedValue <= 0.0 ||
+        parsedValue > 1000000000.0)
+    {
+        return FALSE;
+    }
+
+    *outputValue =
+        static_cast<float>(parsedValue);
+
+    return TRUE;
+}
+
+
+static void UpdateRotationFromControls(
+    MaxGLBImportDialogContext* context,
+    BOOL validateCustomValue)
+{
+    if (context == NULL ||
+        context->rotationCombo == NULL)
+    {
+        return;
+    }
+
+    const int selectedIndex =
+        static_cast<int>(
+            SendMessage(
+                context->rotationCombo,
+                CB_GETCURSEL,
+                0,
+                0));
+
+    BOOL customRotation = FALSE;
+
+    switch (selectedIndex)
+    {
+    case 1:
+        context->settings.rotationXDegrees =
+            90.0f;
+        break;
+
+    case 2:
+        context->settings.rotationXDegrees =
+            -90.0f;
+        break;
+
+    case 3:
+        context->settings.rotationXDegrees =
+            180.0f;
+        break;
+
+    case 4:
+        customRotation = TRUE;
+        {
+            float customDegrees =
+                context->settings.rotationXDegrees;
+
+            if (TryReadCustomRotation(
+                    context->customRotationEdit,
+                    &customDegrees))
+            {
+                context->settings.rotationXDegrees =
+                    customDegrees;
+            }
+            else if (validateCustomValue)
+            {
+                MessageBox(
+                    context->window,
+                    _T("Please enter a valid custom X rotation in degrees."),
+                    _T("MaxGLB2016"),
+                    MB_OK |
+                    MB_ICONWARNING);
+            }
+        }
+        break;
+
+    case 0:
+    default:
+        context->settings.rotationXDegrees =
+            0.0f;
+        break;
+    }
+
+    EnableWindow(
+        context->customRotationEdit,
+        customRotation);
+
+    if (context->previewWindow != NULL)
+    {
+        InvalidateRect(
+            context->previewWindow,
+            NULL,
+            FALSE);
+    }
+}
+
+
+static int RotationComboIndexForSettings(
+    const MaxGLBImportSettings& settings)
+{
+    if (fabsf(settings.rotationXDegrees) < 0.001f)
+    {
+        return 0;
+    }
+
+    if (fabsf(settings.rotationXDegrees - 90.0f) < 0.001f)
+    {
+        return 1;
+    }
+
+    if (fabsf(settings.rotationXDegrees + 90.0f) < 0.001f)
+    {
+        return 2;
+    }
+
+    if (fabsf(fabsf(settings.rotationXDegrees) - 180.0f) < 0.001f)
+    {
+        return 3;
+    }
+
+    return 4;
+}
+
+
+static void GetFilenameOnly(
+    const TCHAR* fullPath,
+    TCHAR* outputName,
+    size_t outputNameCount)
+{
+    if (outputName == NULL ||
+        outputNameCount == 0)
+    {
+        return;
+    }
+
+    outputName[0] = _T('\0');
+
+    if (fullPath == NULL)
+    {
+        return;
+    }
+
+    const TCHAR* lastBackslash =
+        _tcsrchr(
+            fullPath,
+            _T('\\'));
+
+    const TCHAR* lastForwardSlash =
+        _tcsrchr(
+            fullPath,
+            _T('/'));
+
+    const TCHAR* filename =
+        fullPath;
+
+    if (lastBackslash != NULL &&
+        lastBackslash + 1 > filename)
+    {
+        filename =
+            lastBackslash + 1;
+    }
+
+    if (lastForwardSlash != NULL &&
+        lastForwardSlash + 1 > filename)
+    {
+        filename =
+            lastForwardSlash + 1;
+    }
+
+    _tcscpy_s(
+        outputName,
+        outputNameCount,
+        filename);
+}
+
+
+static LRESULT CALLBACK MaxGLBImportWindowProcedure(
+    HWND window,
+    UINT message,
+    WPARAM wordParameter,
+    LPARAM longParameter)
+{
+    MaxGLBImportDialogContext* context =
+        reinterpret_cast<MaxGLBImportDialogContext*>(
+            GetWindowLongPtr(
+                window,
+                GWLP_USERDATA));
+
+    if (message == WM_NCCREATE)
+    {
+        CREATESTRUCT* createStruct =
+            reinterpret_cast<CREATESTRUCT*>(
+                longParameter);
+
+        context =
+            reinterpret_cast<MaxGLBImportDialogContext*>(
+                createStruct->lpCreateParams);
+
+        SetWindowLongPtr(
+            window,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(context));
+    }
+
+    switch (message)
+    {
+    case WM_CREATE:
+        {
+            if (context == NULL)
+            {
+                return -1;
+            }
+
+            context->window =
+                window;
+
+            TCHAR filenameOnly[MAX_PATH];
+            GetFilenameOnly(
+                context->filename,
+                filenameOnly,
+                _countof(filenameOnly));
+
+            TCHAR headerText[MAX_PATH + 64];
+            _stprintf_s(
+                headerText,
+                _countof(headerText),
+                _T("File: %s"),
+                filenameOnly);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                headerText,
+                WS_CHILD |
+                WS_VISIBLE |
+                SS_LEFT,
+                16,
+                12,
+                660,
+                20,
+                window,
+                0,
+                NULL);
+
+            context->previewWindow =
+                CreateImportControl(
+                    0,
+                    MAXGLB_PREVIEW_WINDOW_CLASS,
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    16,
+                    40,
+                    150,
+                    150,
+                    window,
+                    0,
+                    context);
+
+            TCHAR summaryText[512];
+            _stprintf_s(
+                summaryText,
+                _countof(summaryText),
+                _T("Nodes: %u\r\n")
+                _T("Meshes: %u\r\n")
+                _T("Imported objects: %d\r\n")
+                _T("Materials: %u\r\n")
+                _T("Textures: %u\r\n")
+                _T("Animations: %u"),
+                static_cast<unsigned int>(
+                    context->data->nodes_count),
+                static_cast<unsigned int>(
+                    context->data->meshes_count),
+                context->importableObjectCount,
+                static_cast<unsigned int>(
+                    context->data->materials_count),
+                static_cast<unsigned int>(
+                    context->data->images_count),
+                static_cast<unsigned int>(
+                    context->data->animations_count));
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                summaryText,
+                WS_CHILD |
+                WS_VISIBLE |
+                SS_LEFT,
+                16,
+                200,
+                150,
+                105,
+                window,
+                0,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Object tree"),
+                WS_CHILD |
+                WS_VISIBLE,
+                180,
+                40,
+                250,
+                18,
+                window,
+                0,
+                NULL);
+
+            HWND objectList =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("LISTBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_VSCROLL |
+                    WS_HSCROLL |
+                    LBS_NOINTEGRALHEIGHT,
+                    180,
+                    60,
+                    250,
+                    165,
+                    window,
+                    MAXGLB_ID_OBJECT_LIST,
+                    NULL);
+
+            PopulateObjectTreeList(
+                objectList,
+                context->data);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Materials"),
+                WS_CHILD |
+                WS_VISIBLE,
+                445,
+                40,
+                230,
+                18,
+                window,
+                0,
+                NULL);
+
+            HWND materialList =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("LISTBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_VSCROLL |
+                    LBS_NOINTEGRALHEIGHT,
+                    445,
+                    60,
+                    230,
+                    70,
+                    window,
+                    MAXGLB_ID_MATERIAL_LIST,
+                    NULL);
+
+            PopulateMaterialList(
+                materialList,
+                context->data);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Textures"),
+                WS_CHILD |
+                WS_VISIBLE,
+                445,
+                140,
+                230,
+                18,
+                window,
+                0,
+                NULL);
+
+            HWND textureList =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("LISTBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_VSCROLL |
+                    LBS_NOINTEGRALHEIGHT,
+                    445,
+                    160,
+                    230,
+                    65,
+                    window,
+                    MAXGLB_ID_TEXTURE_LIST,
+                    NULL);
+
+            PopulateTextureList(
+                textureList,
+                context->data);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("X rotation correction:"),
+                WS_CHILD |
+                WS_VISIBLE,
+                180,
+                245,
+                135,
+                22,
+                window,
+                0,
+                NULL);
+
+            context->rotationCombo =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("COMBOBOX"),
+                    _T(""),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    CBS_DROPDOWNLIST |
+                    WS_VSCROLL,
+                    315,
+                    240,
+                    185,
+                    160,
+                    window,
+                    MAXGLB_ID_ROTATION_COMBO,
+                    NULL);
+
+            SendMessage(
+                context->rotationCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Auto / standard glTF (0 deg)")));
+
+            SendMessage(
+                context->rotationCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Rotate +90 deg around X")));
+
+            SendMessage(
+                context->rotationCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Rotate -90 deg around X")));
+
+            SendMessage(
+                context->rotationCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Rotate 180 deg around X")));
+
+            SendMessage(
+                context->rotationCombo,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(
+                    _T("Custom angle")));
+
+            const int rotationIndex =
+                RotationComboIndexForSettings(
+                    context->settings);
+
+            SendMessage(
+                context->rotationCombo,
+                CB_SETCURSEL,
+                rotationIndex,
+                0);
+
+            TCHAR customRotationText[64];
+            _stprintf_s(
+                customRotationText,
+                _countof(customRotationText),
+                _T("%.3f"),
+                context->settings.rotationXDegrees);
+
+            context->customRotationEdit =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("EDIT"),
+                    customRotationText,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    ES_AUTOHSCROLL,
+                    510,
+                    240,
+                    80,
+                    24,
+                    window,
+                    MAXGLB_ID_CUSTOM_ROTATION,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->customRotationEdit);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("degrees"),
+                WS_CHILD |
+                WS_VISIBLE,
+                596,
+                245,
+                60,
+                20,
+                window,
+                0,
+                NULL);
+
+            context->importTexturesCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Import textures"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    180,
+                    280,
+                    150,
+                    24,
+                    window,
+                    MAXGLB_ID_IMPORT_TEXTURES,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->importTexturesCheck);
+
+            SetImportCheckboxState(
+                context->importTexturesCheck,
+                context->settings.importTextures);
+
+            context->addParentCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Add parent node (Root:NAME)"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    340,
+                    280,
+                    220,
+                    24,
+                    window,
+                    MAXGLB_ID_ADD_PARENT,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->addParentCheck);
+
+            SetImportCheckboxState(
+                context->addParentCheck,
+                context->settings.addParentNode &&
+                context->importableObjectCount > 1);
+
+            EnableWindow(
+                context->addParentCheck,
+                context->importableObjectCount > 1);
+
+            InvalidateRect(
+                context->addParentCheck,
+                NULL,
+                TRUE);
+
+            context->normalizeSizeCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Normalize largest dimension to"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    180,
+                    310,
+                    205,
+                    24,
+                    window,
+                    MAXGLB_ID_NORMALIZE_SIZE,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->normalizeSizeCheck);
+
+            SetImportCheckboxState(
+                context->normalizeSizeCheck,
+                context->settings.normalizeSize);
+
+            TCHAR normalizeTargetText[64];
+            _stprintf_s(
+                normalizeTargetText,
+                _countof(normalizeTargetText),
+                _T("%.3f"),
+                context->settings.normalizeTargetSize);
+
+            context->normalizeTargetEdit =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("EDIT"),
+                    normalizeTargetText,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    ES_AUTOHSCROLL,
+                    395,
+                    310,
+                    80,
+                    24,
+                    window,
+                    MAXGLB_ID_NORMALIZE_TARGET,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->normalizeTargetEdit);
+
+            EnableWindow(
+                context->normalizeTargetEdit,
+                context->settings.normalizeSize);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Max units"),
+                WS_CHILD |
+                WS_VISIBLE,
+                482,
+                315,
+                70,
+                20,
+                window,
+                0,
+                NULL);
+
+            context->animationCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Import animation (not implemented)"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    BS_OWNERDRAW,
+                    180,
+                    340,
+                    230,
+                    24,
+                    window,
+                    MAXGLB_ID_IMPORT_ANIMATION,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->animationCheck);
+
+            SetImportCheckboxState(
+                context->animationCheck,
+                FALSE);
+
+            EnableWindow(
+                context->animationCheck,
+                FALSE);
+
+            InvalidateRect(
+                context->animationCheck,
+                NULL,
+                TRUE);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Preview is the Max Front view: X is horizontal and Z+ is up.\r\n")
+                _T("Use an X correction only when the model is sideways or upside down."),
+                WS_CHILD |
+                WS_VISIBLE |
+                SS_LEFT,
+                180,
+                370,
+                470,
+                38,
+                window,
+                0,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("BUTTON"),
+                _T("Info"),
+                WS_CHILD |
+                WS_VISIBLE |
+                WS_TABSTOP |
+                BS_OWNERDRAW,
+                16,
+                415,
+                80,
+                28,
+                window,
+                MAXGLB_ID_INFO,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("BUTTON"),
+                _T("Cancel"),
+                WS_CHILD |
+                WS_VISIBLE |
+                WS_TABSTOP |
+                BS_OWNERDRAW,
+                505,
+                415,
+                80,
+                28,
+                window,
+                MAXGLB_ID_CANCEL,
+                NULL);
+
+            HWND importButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Import"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    595,
+                    415,
+                    80,
+                    28,
+                    window,
+                    MAXGLB_ID_IMPORT,
+                    NULL);
+
+            SendMessage(
+                window,
+                DM_SETDEFID,
+                MAXGLB_ID_IMPORT,
+                0);
+
+            UpdateRotationFromControls(
+                context,
+                FALSE);
+
+            SetFocus(importButton);
+        }
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+        {
+            HDC controlDc =
+                reinterpret_cast<HDC>(
+                    wordParameter);
+
+            HWND controlWindow =
+                reinterpret_cast<HWND>(
+                    longParameter);
+
+            if (context != NULL &&
+                (controlWindow ==
+                    context->customRotationEdit ||
+                 controlWindow ==
+                    context->normalizeTargetEdit))
+            {
+                if (IsWindowEnabled(controlWindow))
+                {
+                    SetTextColor(
+                        controlDc,
+                        GetSysColor(
+                            COLOR_WINDOWTEXT));
+
+                    SetBkColor(
+                        controlDc,
+                        GetSysColor(
+                            COLOR_WINDOW));
+
+                    return reinterpret_cast<LRESULT>(
+                        GetSysColorBrush(
+                            COLOR_WINDOW));
+                }
+
+                SetTextColor(
+                    controlDc,
+                    GetSysColor(
+                        COLOR_GRAYTEXT));
+
+                SetBkColor(
+                    controlDc,
+                    GetSysColor(
+                        COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(
+                    GetSysColorBrush(
+                        COLOR_BTNFACE));
+            }
+        }
+        break;
+
+    case WM_CTLCOLORSTATIC:
+        {
+            HDC controlDc =
+                reinterpret_cast<HDC>(
+                    wordParameter);
+
+            HWND controlWindow =
+                reinterpret_cast<HWND>(
+                    longParameter);
+
+            // A disabled edit control is reported through WM_CTLCOLORSTATIC.
+            if (context != NULL &&
+                (controlWindow ==
+                    context->customRotationEdit ||
+                 controlWindow ==
+                    context->normalizeTargetEdit))
+            {
+                SetTextColor(
+                    controlDc,
+                    GetSysColor(
+                        COLOR_GRAYTEXT));
+
+                SetBkColor(
+                    controlDc,
+                    GetSysColor(
+                        COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(
+                    GetSysColorBrush(
+                        COLOR_BTNFACE));
+            }
+        }
+        break;
+
+    case WM_CTLCOLORBTN:
+        {
+            HDC controlDc =
+                reinterpret_cast<HDC>(
+                    wordParameter);
+
+            HWND controlWindow =
+                reinterpret_cast<HWND>(
+                    longParameter);
+
+            const int controlId =
+                GetDlgCtrlID(
+                    controlWindow);
+
+            if (controlId ==
+                    MAXGLB_ID_IMPORT_TEXTURES ||
+                controlId ==
+                    MAXGLB_ID_ADD_PARENT ||
+                controlId ==
+                    MAXGLB_ID_IMPORT_ANIMATION)
+            {
+                SetBkMode(
+                    controlDc,
+                    OPAQUE);
+
+                SetBkColor(
+                    controlDc,
+                    GetSysColor(
+                        COLOR_BTNFACE));
+
+                SetTextColor(
+                    controlDc,
+                    IsWindowEnabled(controlWindow)
+                        ? GetSysColor(
+                            COLOR_BTNTEXT)
+                        : GetSysColor(
+                            COLOR_GRAYTEXT));
+
+                return reinterpret_cast<LRESULT>(
+                    GetSysColorBrush(
+                        COLOR_BTNFACE));
+            }
+        }
+        break;
+
+    case WM_DRAWITEM:
+        {
+            const DRAWITEMSTRUCT* drawItem =
+                reinterpret_cast<const DRAWITEMSTRUCT*>(
+                    longParameter);
+
+            if (drawItem == NULL ||
+                drawItem->CtlType != ODT_BUTTON)
+            {
+                break;
+            }
+
+            const int controlId =
+                static_cast<int>(
+                    drawItem->CtlID);
+
+            if (IsImportCheckboxId(controlId))
+            {
+                DrawLightImportCheckbox(drawItem);
+                return TRUE;
+            }
+
+            if (IsImportPushButtonId(controlId))
+            {
+                DrawLightImportPushButton(drawItem);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        {
+            if (context == NULL)
+            {
+                break;
+            }
+
+            const int controlId =
+                LOWORD(wordParameter);
+
+            const int notificationCode =
+                HIWORD(wordParameter);
+
+            if ((controlId == MAXGLB_ID_IMPORT_TEXTURES ||
+                 controlId == MAXGLB_ID_ADD_PARENT ||
+                 controlId == MAXGLB_ID_NORMALIZE_SIZE) &&
+                notificationCode == BN_CLICKED)
+            {
+                HWND checkbox =
+                    reinterpret_cast<HWND>(
+                        longParameter);
+
+                const BOOL newState =
+                    !GetImportCheckboxState(
+                        checkbox);
+
+                SetImportCheckboxState(
+                    checkbox,
+                    newState);
+
+                if (controlId == MAXGLB_ID_NORMALIZE_SIZE &&
+                    context->normalizeTargetEdit != NULL)
+                {
+                    EnableWindow(
+                        context->normalizeTargetEdit,
+                        newState);
+
+                    InvalidateRect(
+                        context->normalizeTargetEdit,
+                        NULL,
+                        TRUE);
+                }
+
+                UpdateWindow(checkbox);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_ROTATION_COMBO &&
+                notificationCode == CBN_SELCHANGE)
+            {
+                UpdateRotationFromControls(
+                    context,
+                    FALSE);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_CUSTOM_ROTATION &&
+                notificationCode == EN_CHANGE)
+            {
+                const int selectedIndex =
+                    static_cast<int>(
+                        SendMessage(
+                            context->rotationCombo,
+                            CB_GETCURSEL,
+                            0,
+                            0));
+
+                if (selectedIndex == 4)
+                {
+                    UpdateRotationFromControls(
+                        context,
+                        FALSE);
+                }
+
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_INFO)
+            {
+                MessageBox(
+                    window,
+                    _T("MaxGLB2016 imports static triangle meshes for editing and optimization in 3ds Max 2016.\n\n")
+                    _T("The preview uses the 3ds Max Front view: X is horizontal, Z+ points upward, and the camera looks along -Y.\n\n")
+                    _T("Auto rotation performs only the official glTF Y-up to Max Z-up conversion. The additional X angle is a user correction.\n\n")
+                    _T("When Add parent node is enabled, all created mesh nodes are attached below a Dummy helper named Root:NAME.\n\n")
+                    _T("Normalize size scales the complete imported model uniformly so its largest world-space dimension equals the entered Max-unit value.\n\n")
+                    _T("Animation is intentionally outside the current static-model workflow."),
+                    _T("MaxGLB2016 Import Information"),
+                    MB_OK |
+                    MB_ICONINFORMATION);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_CANCEL ||
+                controlId == IDCANCEL)
+            {
+                context->accepted = FALSE;
+                DestroyWindow(window);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_IMPORT ||
+                controlId == IDOK)
+            {
+                const int selectedIndex =
+                    static_cast<int>(
+                        SendMessage(
+                            context->rotationCombo,
+                            CB_GETCURSEL,
+                            0,
+                            0));
+
+                if (selectedIndex == 4)
+                {
+                    float customDegrees = 0.0f;
+
+                    if (!TryReadCustomRotation(
+                            context->customRotationEdit,
+                            &customDegrees))
+                    {
+                        MessageBox(
+                            window,
+                            _T("Please enter a valid custom X rotation in degrees."),
+                            _T("MaxGLB2016"),
+                            MB_OK |
+                            MB_ICONWARNING);
+                        return 0;
+                    }
+
+                    context->settings.rotationXDegrees =
+                        customDegrees;
+                }
+                else
+                {
+                    UpdateRotationFromControls(
+                        context,
+                        TRUE);
+                }
+
+                context->settings.importTextures =
+                    GetImportCheckboxState(
+                        context->importTexturesCheck);
+
+                context->settings.addParentNode =
+                    context->importableObjectCount > 1 &&
+                    GetImportCheckboxState(
+                        context->addParentCheck);
+
+                context->settings.normalizeSize =
+                    GetImportCheckboxState(
+                        context->normalizeSizeCheck);
+
+                if (context->settings.normalizeSize)
+                {
+                    float targetSize = 1.0f;
+
+                    if (!TryReadPositiveImportSize(
+                            context->normalizeTargetEdit,
+                            &targetSize))
+                    {
+                        MessageBox(
+                            window,
+                            _T("Please enter a positive normalize size."),
+                            _T("MaxGLB2016"),
+                            MB_OK |
+                            MB_ICONWARNING);
+                        return 0;
+                    }
+
+                    context->settings.normalizeTargetSize =
+                        targetSize;
+                }
+
+                context->settings.appliedUniformScale =
+                    1.0f;
+
+                context->settings.importAnimation =
+                    FALSE;
+
+                context->accepted = TRUE;
+                DestroyWindow(window);
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CLOSE:
+        if (context != NULL)
+        {
+            context->accepted = FALSE;
+        }
+
+        DestroyWindow(window);
+        return 0;
+
+    case WM_DESTROY:
+        if (context != NULL)
+        {
+            context->closed = TRUE;
+            context->window = NULL;
+        }
+        return 0;
+    }
+
+    return DefWindowProc(
+        window,
+        message,
+        wordParameter,
+        longParameter);
+}
+
+
+static BOOL RegisterMaxGLBImportWindowClasses()
+{
+    WNDCLASSEX previewClass;
+    ZeroMemory(
+        &previewClass,
+        sizeof(previewClass));
+
+    previewClass.cbSize =
+        sizeof(previewClass);
+
+    previewClass.style =
+        CS_HREDRAW |
+        CS_VREDRAW;
+
+    previewClass.lpfnWndProc =
+        MaxGLBPreviewWindowProcedure;
+
+    previewClass.hInstance =
+        hInstance;
+
+    previewClass.hCursor =
+        LoadCursor(
+            NULL,
+            IDC_ARROW);
+
+    previewClass.lpszClassName =
+        MAXGLB_PREVIEW_WINDOW_CLASS;
+
+    if (!RegisterClassEx(&previewClass) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return FALSE;
+    }
+
+    WNDCLASSEX importClass;
+    ZeroMemory(
+        &importClass,
+        sizeof(importClass));
+
+    importClass.cbSize =
+        sizeof(importClass);
+
+    importClass.style =
+        CS_HREDRAW |
+        CS_VREDRAW;
+
+    importClass.lpfnWndProc =
+        MaxGLBImportWindowProcedure;
+
+    importClass.hInstance =
+        hInstance;
+
+    importClass.hIcon =
+        LoadIcon(
+            NULL,
+            IDI_APPLICATION);
+
+    importClass.hCursor =
+        LoadCursor(
+            NULL,
+            IDC_ARROW);
+
+    importClass.hbrBackground =
+        reinterpret_cast<HBRUSH>(
+            COLOR_BTNFACE + 1);
+
+    importClass.lpszClassName =
+        MAXGLB_IMPORT_WINDOW_CLASS;
+
+    if (!RegisterClassEx(&importClass) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static BOOL ShowMaxGLBImportOptions(
+    HWND parentWindow,
+    const TCHAR* filename,
+    const cgltf_data* data,
+    MaxGLBImportSettings* settings)
+{
+    if (data == NULL ||
+        settings == NULL ||
+        !RegisterMaxGLBImportWindowClasses())
+    {
+        return FALSE;
+    }
+
+    MaxGLBImportDialogContext context;
+    context.parentWindow =
+        parentWindow;
+
+    context.filename =
+        filename;
+
+    context.data =
+        data;
+
+    context.settings =
+        *settings;
+
+    context.importableObjectCount =
+        CountImportableScenePrimitives(data);
+
+    CollectScenePreviewPoints(
+        data,
+        context.previewPoints);
+
+    const int clientWidth = 700;
+    const int clientHeight = 460;
+
+    RECT windowRect =
+    {
+        0,
+        0,
+        clientWidth,
+        clientHeight
+    };
+
+    AdjustWindowRectEx(
+        &windowRect,
+        WS_CAPTION |
+        WS_SYSMENU |
+        WS_POPUP,
+        FALSE,
+        WS_EX_DLGMODALFRAME |
+        WS_EX_CONTROLPARENT);
+
+    const int windowWidth =
+        windowRect.right -
+        windowRect.left;
+
+    const int windowHeight =
+        windowRect.bottom -
+        windowRect.top;
+
+    int windowX =
+        CW_USEDEFAULT;
+
+    int windowY =
+        CW_USEDEFAULT;
+
+    if (parentWindow != NULL)
+    {
+        RECT parentRect;
+
+        if (GetWindowRect(
+                parentWindow,
+                &parentRect))
+        {
+            windowX =
+                parentRect.left +
+                ((parentRect.right - parentRect.left) -
+                 windowWidth) / 2;
+
+            windowY =
+                parentRect.top +
+                ((parentRect.bottom - parentRect.top) -
+                 windowHeight) / 2;
+        }
+    }
+
+    if (parentWindow != NULL)
+    {
+        EnableWindow(
+            parentWindow,
+            FALSE);
+    }
+
+    HWND importWindow =
+        CreateWindowEx(
+            WS_EX_DLGMODALFRAME |
+            WS_EX_CONTROLPARENT,
+            MAXGLB_IMPORT_WINDOW_CLASS,
+            _T("MaxGLB2016 Import Options"),
+            WS_CAPTION |
+            WS_SYSMENU |
+            WS_POPUP,
+            windowX,
+            windowY,
+            windowWidth,
+            windowHeight,
+            parentWindow,
+            NULL,
+            hInstance,
+            &context);
+
+    if (importWindow == NULL)
+    {
+        if (parentWindow != NULL)
+        {
+            EnableWindow(
+                parentWindow,
+                TRUE);
+        }
+
+        return FALSE;
+    }
+
+    ShowWindow(
+        importWindow,
+        SW_SHOW);
+
+    UpdateWindow(
+        importWindow);
+
+    MSG message;
+    BOOL receivedQuitMessage = FALSE;
+    int quitCode = 0;
+
+    while (!context.closed)
+    {
+        const BOOL messageResult =
+            GetMessage(
+                &message,
+                NULL,
+                0,
+                0);
+
+        if (messageResult <= 0)
+        {
+            if (messageResult == 0)
+            {
+                receivedQuitMessage = TRUE;
+                quitCode =
+                    static_cast<int>(
+                        message.wParam);
+            }
+
+            break;
+        }
+
+        if (!IsDialogMessage(
+                importWindow,
+                &message))
+        {
+            TranslateMessage(
+                &message);
+
+            DispatchMessage(
+                &message);
+        }
+    }
+
+    if (IsWindow(importWindow))
+    {
+        DestroyWindow(importWindow);
+    }
+
+    if (parentWindow != NULL)
+    {
+        EnableWindow(
+            parentWindow,
+            TRUE);
+
+        SetForegroundWindow(
+            parentWindow);
+    }
+
+    if (receivedQuitMessage)
+    {
+        PostQuitMessage(
+            quitCode);
+    }
+
+    if (context.accepted)
+    {
+        *settings =
+            context.settings;
+    }
+
+    return context.accepted;
+}
+
+
+
+static const TCHAR* MAXGLB_EXPORT_WINDOW_CLASS =
+    _T("MaxGLB2016ExportOptionsWindow");
+
+
+struct MaxGLBExportDialogContext
+{
+    HWND parentWindow;
+    HWND window;
+
+    HWND scaleEdit;
+    HWND normalizeCheck;
+    HWND normalizeTargetEdit;
+    HWND materialsCheck;
+    HWND texturesCheck;
+    HWND summaryCheck;
+    HWND explorerCheck;
+    HWND animationCheck;
+
+    const TCHAR* outputFilename;
+    BOOL selectedOnly;
+
+    MaxGLBExportSettings settings;
+
+    BOOL accepted;
+    BOOL closed;
+
+    MaxGLBExportDialogContext()
+        : parentWindow(NULL)
+        , window(NULL)
+        , scaleEdit(NULL)
+        , normalizeCheck(NULL)
+        , normalizeTargetEdit(NULL)
+        , materialsCheck(NULL)
+        , texturesCheck(NULL)
+        , summaryCheck(NULL)
+        , explorerCheck(NULL)
+        , animationCheck(NULL)
+        , outputFilename(NULL)
+        , selectedOnly(FALSE)
+        , accepted(FALSE)
+        , closed(FALSE)
+    {
+    }
+};
+
+
+static BOOL IsExportCheckboxId(
+    int controlId)
+{
+    return controlId == MAXGLB_ID_EXPORT_NORMALIZE ||
+        controlId == MAXGLB_ID_EXPORT_MATERIALS ||
+        controlId == MAXGLB_ID_EXPORT_TEXTURES ||
+        controlId == MAXGLB_ID_EXPORT_SUMMARY ||
+        controlId == MAXGLB_ID_EXPORT_EXPLORER ||
+        controlId == MAXGLB_ID_EXPORT_ANIMATION;
+}
+
+
+static BOOL IsExportPushButtonId(
+    int controlId)
+{
+    return controlId == MAXGLB_ID_EXPORT_INFO ||
+        controlId == MAXGLB_ID_EXPORT_CANCEL ||
+        controlId == MAXGLB_ID_EXPORT_CONFIRM;
+}
+
+
+static void UpdateExportDialogEnabledState(
+    MaxGLBExportDialogContext* context)
+{
+    if (context == NULL)
+    {
+        return;
+    }
+
+    const BOOL normalizeEnabled =
+        GetImportCheckboxState(
+            context->normalizeCheck);
+
+    EnableWindow(
+        context->scaleEdit,
+        !normalizeEnabled);
+
+    EnableWindow(
+        context->normalizeTargetEdit,
+        normalizeEnabled);
+
+    const BOOL materialsEnabled =
+        GetImportCheckboxState(
+            context->materialsCheck);
+
+    EnableWindow(
+        context->texturesCheck,
+        materialsEnabled);
+
+    InvalidateRect(
+        context->scaleEdit,
+        NULL,
+        TRUE);
+
+    InvalidateRect(
+        context->normalizeTargetEdit,
+        NULL,
+        TRUE);
+
+    InvalidateRect(
+        context->texturesCheck,
+        NULL,
+        TRUE);
+}
+
+
+static LRESULT CALLBACK MaxGLBExportWindowProcedure(
+    HWND window,
+    UINT message,
+    WPARAM wordParameter,
+    LPARAM longParameter)
+{
+    MaxGLBExportDialogContext* context =
+        reinterpret_cast<MaxGLBExportDialogContext*>(
+            GetWindowLongPtr(
+                window,
+                GWLP_USERDATA));
+
+    switch (message)
+    {
+    case WM_NCCREATE:
+        {
+            const CREATESTRUCT* createStruct =
+                reinterpret_cast<const CREATESTRUCT*>(
+                    longParameter);
+
+            context =
+                reinterpret_cast<MaxGLBExportDialogContext*>(
+                    createStruct->lpCreateParams);
+
+            SetWindowLongPtr(
+                window,
+                GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(
+                    context));
+
+            if (context != NULL)
+            {
+                context->window =
+                    window;
+            }
+        }
+        break;
+
+    case WM_CREATE:
+        {
+            context =
+                reinterpret_cast<MaxGLBExportDialogContext*>(
+                    reinterpret_cast<CREATESTRUCT*>(
+                        longParameter)->lpCreateParams);
+
+            if (context == NULL)
+            {
+                return -1;
+            }
+
+            TCHAR modeText[128];
+
+            _stprintf_s(
+                modeText,
+                _countof(modeText),
+                _T("Mode: %s"),
+                context->selectedOnly
+                    ? _T("Export Selected")
+                    : _T("Export Scene"));
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                modeText,
+                WS_CHILD |
+                WS_VISIBLE,
+                16,
+                14,
+                500,
+                20,
+                window,
+                -1,
+                NULL);
+
+            TCHAR outputText[512];
+
+            _stprintf_s(
+                outputText,
+                _countof(outputText),
+                _T("Output: %s"),
+                context->outputFilename != NULL
+                    ? context->outputFilename
+                    : _T(""));
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                outputText,
+                WS_CHILD |
+                WS_VISIBLE |
+                SS_PATHELLIPSIS,
+                16,
+                36,
+                500,
+                20,
+                window,
+                -1,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Size"),
+                WS_CHILD |
+                WS_VISIBLE,
+                16,
+                72,
+                180,
+                20,
+                window,
+                -1,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Uniform scale factor:"),
+                WS_CHILD |
+                WS_VISIBLE,
+                30,
+                101,
+                165,
+                20,
+                window,
+                -1,
+                NULL);
+
+            TCHAR scaleText[64];
+
+            _stprintf_s(
+                scaleText,
+                _countof(scaleText),
+                _T("%.6g"),
+                context->settings.scaleFactor);
+
+            context->scaleEdit =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("EDIT"),
+                    scaleText,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    ES_AUTOHSCROLL,
+                    200,
+                    98,
+                    95,
+                    24,
+                    window,
+                    MAXGLB_ID_EXPORT_SCALE,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->scaleEdit);
+
+            context->normalizeCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Normalize largest dimension to"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    132,
+                    245,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_NORMALIZE,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->normalizeCheck,
+                context->settings.normalizeSize);
+
+            TCHAR normalizeText[64];
+
+            _stprintf_s(
+                normalizeText,
+                _countof(normalizeText),
+                _T("%.6g"),
+                context->settings.normalizeTargetSize);
+
+            context->normalizeTargetEdit =
+                CreateImportControl(
+                    WS_EX_CLIENTEDGE,
+                    _T("EDIT"),
+                    normalizeText,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    ES_AUTOHSCROLL,
+                    275,
+                    133,
+                    95,
+                    24,
+                    window,
+                    MAXGLB_ID_EXPORT_NORMALIZE_TARGET,
+                    NULL);
+
+            UseReadableClassicTheme(
+                context->normalizeTargetEdit);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Max units"),
+                WS_CHILD |
+                WS_VISIBLE,
+                378,
+                137,
+                90,
+                20,
+                window,
+                -1,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Materials"),
+                WS_CHILD |
+                WS_VISIBLE,
+                16,
+                176,
+                180,
+                20,
+                window,
+                -1,
+                NULL);
+
+            context->materialsCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Export Standard materials"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    204,
+                    250,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_MATERIALS,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->materialsCheck,
+                context->settings.exportMaterials);
+
+            context->texturesCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Export textures (embedded in GLB)"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    234,
+                    300,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_TEXTURES,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->texturesCheck,
+                context->settings.exportTextures);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("Geometry is always triangulated; modifier stacks, transforms, normals and UV channel 1 are exported automatically."),
+                WS_CHILD |
+                WS_VISIBLE,
+                28,
+                266,
+                470,
+                36,
+                window,
+                -1,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("STATIC"),
+                _T("After export"),
+                WS_CHILD |
+                WS_VISIBLE,
+                16,
+                312,
+                180,
+                20,
+                window,
+                -1,
+                NULL);
+
+            context->summaryCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Show export summary"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    338,
+                    230,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_SUMMARY,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->summaryCheck,
+                context->settings.showSummary);
+
+            context->explorerCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Show exported file in Windows Explorer"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    27,
+                    368,
+                    330,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_EXPLORER,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->explorerCheck,
+                context->settings.showInExplorer);
+
+            context->animationCheck =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Export animation (not implemented)"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    BS_OWNERDRAW,
+                    27,
+                    398,
+                    300,
+                    26,
+                    window,
+                    MAXGLB_ID_EXPORT_ANIMATION,
+                    NULL);
+
+            SetImportCheckboxState(
+                context->animationCheck,
+                FALSE);
+
+            EnableWindow(
+                context->animationCheck,
+                FALSE);
+
+            CreateImportControl(
+                0,
+                _T("BUTTON"),
+                _T("Info"),
+                WS_CHILD |
+                WS_VISIBLE |
+                WS_TABSTOP |
+                BS_OWNERDRAW,
+                16,
+                442,
+                80,
+                29,
+                window,
+                MAXGLB_ID_EXPORT_INFO,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("BUTTON"),
+                _T("Cancel"),
+                WS_CHILD |
+                WS_VISIBLE |
+                WS_TABSTOP |
+                BS_OWNERDRAW,
+                350,
+                442,
+                80,
+                29,
+                window,
+                MAXGLB_ID_EXPORT_CANCEL,
+                NULL);
+
+            CreateImportControl(
+                0,
+                _T("BUTTON"),
+                _T("Export"),
+                WS_CHILD |
+                WS_VISIBLE |
+                WS_TABSTOP |
+                BS_OWNERDRAW,
+                440,
+                442,
+                80,
+                29,
+                window,
+                MAXGLB_ID_EXPORT_CONFIRM,
+                NULL);
+
+            SendMessage(
+                window,
+                DM_SETDEFID,
+                MAXGLB_ID_EXPORT_CONFIRM,
+                0);
+
+            UpdateExportDialogEnabledState(
+                context);
+        }
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+        {
+            HDC controlDc =
+                reinterpret_cast<HDC>(
+                    wordParameter);
+
+            HWND controlWindow =
+                reinterpret_cast<HWND>(
+                    longParameter);
+
+            if (context != NULL &&
+                (controlWindow == context->scaleEdit ||
+                 controlWindow == context->normalizeTargetEdit))
+            {
+                if (IsWindowEnabled(controlWindow))
+                {
+                    SetTextColor(
+                        controlDc,
+                        GetSysColor(COLOR_WINDOWTEXT));
+
+                    SetBkColor(
+                        controlDc,
+                        GetSysColor(COLOR_WINDOW));
+
+                    return reinterpret_cast<LRESULT>(
+                        GetSysColorBrush(COLOR_WINDOW));
+                }
+
+                SetTextColor(
+                    controlDc,
+                    GetSysColor(COLOR_GRAYTEXT));
+
+                SetBkColor(
+                    controlDc,
+                    GetSysColor(COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(
+                    GetSysColorBrush(COLOR_BTNFACE));
+            }
+        }
+        break;
+
+    case WM_CTLCOLORSTATIC:
+        {
+            HDC controlDc =
+                reinterpret_cast<HDC>(
+                    wordParameter);
+
+            HWND controlWindow =
+                reinterpret_cast<HWND>(
+                    longParameter);
+
+            if (context != NULL &&
+                (controlWindow == context->scaleEdit ||
+                 controlWindow == context->normalizeTargetEdit))
+            {
+                SetTextColor(
+                    controlDc,
+                    GetSysColor(COLOR_GRAYTEXT));
+
+                SetBkColor(
+                    controlDc,
+                    GetSysColor(COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(
+                    GetSysColorBrush(COLOR_BTNFACE));
+            }
+        }
+        break;
+
+    case WM_DRAWITEM:
+        {
+            const DRAWITEMSTRUCT* drawItem =
+                reinterpret_cast<const DRAWITEMSTRUCT*>(
+                    longParameter);
+
+            if (drawItem == NULL ||
+                drawItem->CtlType != ODT_BUTTON)
+            {
+                break;
+            }
+
+            const int controlId =
+                static_cast<int>(
+                    drawItem->CtlID);
+
+            if (IsExportCheckboxId(controlId))
+            {
+                DrawLightImportCheckbox(drawItem);
+                return TRUE;
+            }
+
+            if (IsExportPushButtonId(controlId))
+            {
+                DrawLightImportPushButton(drawItem);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        {
+            if (context == NULL)
+            {
+                break;
+            }
+
+            const int controlId =
+                LOWORD(wordParameter);
+
+            const int notificationCode =
+                HIWORD(wordParameter);
+
+            if ((controlId == MAXGLB_ID_EXPORT_NORMALIZE ||
+                 controlId == MAXGLB_ID_EXPORT_MATERIALS ||
+                 controlId == MAXGLB_ID_EXPORT_TEXTURES ||
+                 controlId == MAXGLB_ID_EXPORT_SUMMARY ||
+                 controlId == MAXGLB_ID_EXPORT_EXPLORER) &&
+                notificationCode == BN_CLICKED)
+            {
+                HWND checkbox =
+                    reinterpret_cast<HWND>(
+                        longParameter);
+
+                if (IsWindowEnabled(checkbox))
+                {
+                    SetImportCheckboxState(
+                        checkbox,
+                        !GetImportCheckboxState(
+                            checkbox));
+                }
+
+                UpdateExportDialogEnabledState(
+                    context);
+
+                UpdateWindow(checkbox);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_EXPORT_INFO)
+            {
+                MessageBox(
+                    window,
+                    _T("MaxGLB2016 exports static models for editing, optimization and arrangement workflows.\n\n")
+                    _T("Uniform scale multiplies all baked world-space positions. Normalize instead scales the complete export uniformly so its largest dimension matches the requested Max-unit value.\n\n")
+                    _T("GLB stores all enabled textures inside the output file. Standard material colors and opacity can still be exported when texture export is disabled.\n\n")
+                    _T("Animation is intentionally outside the current static-model workflow."),
+                    _T("MaxGLB2016 Export Information"),
+                    MB_OK |
+                    MB_ICONINFORMATION);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_EXPORT_CANCEL ||
+                controlId == IDCANCEL)
+            {
+                context->accepted = FALSE;
+                DestroyWindow(window);
+                return 0;
+            }
+
+            if (controlId == MAXGLB_ID_EXPORT_CONFIRM ||
+                controlId == IDOK)
+            {
+                float scaleFactor = 1.0f;
+                float normalizeTarget = 1.0f;
+
+                const BOOL normalizeSize =
+                    GetImportCheckboxState(
+                        context->normalizeCheck);
+
+                if (!normalizeSize &&
+                    !TryReadPositiveImportSize(
+                        context->scaleEdit,
+                        &scaleFactor))
+                {
+                    MessageBox(
+                        window,
+                        _T("Please enter a positive uniform scale factor."),
+                        _T("MaxGLB2016"),
+                        MB_OK |
+                        MB_ICONWARNING);
+                    return 0;
+                }
+
+                if (normalizeSize &&
+                    !TryReadPositiveImportSize(
+                        context->normalizeTargetEdit,
+                        &normalizeTarget))
+                {
+                    MessageBox(
+                        window,
+                        _T("Please enter a positive normalize size."),
+                        _T("MaxGLB2016"),
+                        MB_OK |
+                        MB_ICONWARNING);
+                    return 0;
+                }
+
+                context->settings.scaleFactor =
+                    scaleFactor;
+
+                context->settings.normalizeSize =
+                    normalizeSize;
+
+                context->settings.normalizeTargetSize =
+                    normalizeTarget;
+
+                context->settings.appliedUniformScale =
+                    1.0f;
+
+                context->settings.exportMaterials =
+                    GetImportCheckboxState(
+                        context->materialsCheck);
+
+                context->settings.exportTextures =
+                    context->settings.exportMaterials &&
+                    GetImportCheckboxState(
+                        context->texturesCheck);
+
+                context->settings.showSummary =
+                    GetImportCheckboxState(
+                        context->summaryCheck);
+
+                context->settings.showInExplorer =
+                    GetImportCheckboxState(
+                        context->explorerCheck);
+
+                context->settings.exportAnimation =
+                    FALSE;
+
+                context->accepted = TRUE;
+                DestroyWindow(window);
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CLOSE:
+        if (context != NULL)
+        {
+            context->accepted = FALSE;
+        }
+
+        DestroyWindow(window);
+        return 0;
+
+    case WM_DESTROY:
+        if (context != NULL)
+        {
+            context->closed = TRUE;
+            context->window = NULL;
+        }
+        return 0;
+    }
+
+    return DefWindowProc(
+        window,
+        message,
+        wordParameter,
+        longParameter);
+}
+
+
+static BOOL RegisterMaxGLBExportWindowClass()
+{
+    WNDCLASSEX exportClass;
+    ZeroMemory(
+        &exportClass,
+        sizeof(exportClass));
+
+    exportClass.cbSize =
+        sizeof(exportClass);
+
+    exportClass.style =
+        CS_HREDRAW |
+        CS_VREDRAW;
+
+    exportClass.lpfnWndProc =
+        MaxGLBExportWindowProcedure;
+
+    exportClass.hInstance =
+        hInstance;
+
+    exportClass.hIcon =
+        LoadIcon(
+            NULL,
+            IDI_APPLICATION);
+
+    exportClass.hCursor =
+        LoadCursor(
+            NULL,
+            IDC_ARROW);
+
+    exportClass.hbrBackground =
+        reinterpret_cast<HBRUSH>(
+            COLOR_BTNFACE + 1);
+
+    exportClass.lpszClassName =
+        MAXGLB_EXPORT_WINDOW_CLASS;
+
+    if (!RegisterClassEx(&exportClass) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static BOOL ShowMaxGLBExportOptions(
+    HWND parentWindow,
+    const TCHAR* outputFilename,
+    BOOL selectedOnly,
+    MaxGLBExportSettings* settings)
+{
+    if (settings == NULL ||
+        !RegisterMaxGLBExportWindowClass())
+    {
+        return FALSE;
+    }
+
+    MaxGLBExportDialogContext context;
+
+    context.parentWindow =
+        parentWindow;
+
+    context.outputFilename =
+        outputFilename;
+
+    context.selectedOnly =
+        selectedOnly;
+
+    context.settings =
+        *settings;
+
+    const int clientWidth = 536;
+    const int clientHeight = 486;
+
+    RECT windowRect =
+    {
+        0,
+        0,
+        clientWidth,
+        clientHeight
+    };
+
+    AdjustWindowRectEx(
+        &windowRect,
+        WS_CAPTION |
+        WS_SYSMENU |
+        WS_POPUP,
+        FALSE,
+        WS_EX_DLGMODALFRAME |
+        WS_EX_CONTROLPARENT);
+
+    const int windowWidth =
+        windowRect.right -
+        windowRect.left;
+
+    const int windowHeight =
+        windowRect.bottom -
+        windowRect.top;
+
+    int windowX =
+        CW_USEDEFAULT;
+
+    int windowY =
+        CW_USEDEFAULT;
+
+    if (parentWindow != NULL)
+    {
+        RECT parentRect;
+
+        if (GetWindowRect(
+                parentWindow,
+                &parentRect))
+        {
+            windowX =
+                parentRect.left +
+                ((parentRect.right - parentRect.left) -
+                 windowWidth) / 2;
+
+            windowY =
+                parentRect.top +
+                ((parentRect.bottom - parentRect.top) -
+                 windowHeight) / 2;
+        }
+    }
+
+    if (parentWindow != NULL)
+    {
+        EnableWindow(
+            parentWindow,
+            FALSE);
+    }
+
+    HWND exportWindow =
+        CreateWindowEx(
+            WS_EX_DLGMODALFRAME |
+            WS_EX_CONTROLPARENT,
+            MAXGLB_EXPORT_WINDOW_CLASS,
+            _T("MaxGLB2016 Export Options"),
+            WS_CAPTION |
+            WS_SYSMENU |
+            WS_POPUP,
+            windowX,
+            windowY,
+            windowWidth,
+            windowHeight,
+            parentWindow,
+            NULL,
+            hInstance,
+            &context);
+
+    if (exportWindow == NULL)
+    {
+        if (parentWindow != NULL)
+        {
+            EnableWindow(
+                parentWindow,
+                TRUE);
+        }
+
+        return FALSE;
+    }
+
+    ShowWindow(
+        exportWindow,
+        SW_SHOW);
+
+    UpdateWindow(
+        exportWindow);
+
+    MSG message;
+    BOOL receivedQuitMessage = FALSE;
+    int quitCode = 0;
+
+    while (!context.closed)
+    {
+        const BOOL messageResult =
+            GetMessage(
+                &message,
+                NULL,
+                0,
+                0);
+
+        if (messageResult <= 0)
+        {
+            if (messageResult == 0)
+            {
+                receivedQuitMessage = TRUE;
+                quitCode =
+                    static_cast<int>(
+                        message.wParam);
+            }
+
+            break;
+        }
+
+        if (!IsDialogMessage(
+                exportWindow,
+                &message))
+        {
+            TranslateMessage(
+                &message);
+
+            DispatchMessage(
+                &message);
+        }
+    }
+
+    if (IsWindow(exportWindow))
+    {
+        DestroyWindow(exportWindow);
+    }
+
+    if (parentWindow != NULL)
+    {
+        EnableWindow(
+            parentWindow,
+            TRUE);
+
+        SetForegroundWindow(
+            parentWindow);
+    }
+
+    if (receivedQuitMessage)
+    {
+        PostQuitMessage(
+            quitCode);
+    }
+
+    if (context.accepted)
+    {
+        *settings =
+            context.settings;
+    }
+
+    return context.accepted;
 }
 
 
@@ -2704,6 +7213,9 @@ static BOOL ImportPrimitiveAsNode(
         AppendMaterialImportLog(_T("13: material assigned to node"));
     }
 
+    importStats->createdNodes.push_back(
+        maxNode);
+
     ++importStats->objectCount;
     ++importStats->primitiveCount;
 
@@ -2856,6 +7368,168 @@ static BOOL ImportNodeMeshesRecursive(
 }
 
 
+static void BuildImportedRootName(
+    const cgltf_data* data,
+    const TCHAR* sourceFilename,
+    TCHAR* outputName,
+    size_t outputNameCount)
+{
+    if (outputName == NULL ||
+        outputNameCount == 0)
+    {
+        return;
+    }
+
+    TCHAR baseName[256];
+    baseName[0] = _T('\0');
+
+    GetFilenameOnly(
+        sourceFilename,
+        baseName,
+        _countof(baseName));
+
+    TCHAR* extension =
+        _tcsrchr(
+            baseName,
+            _T('.'));
+
+    if (extension != NULL)
+    {
+        *extension = _T('\0');
+    }
+
+    // The filename is more useful than a generic scene name such as
+    // "Scene". Use the glTF scene name only when no filename is available.
+    if (baseName[0] == _T('\0'))
+    {
+        const cgltf_scene* activeScene =
+            data != NULL
+            ? data->scene
+            : NULL;
+
+        if (activeScene == NULL &&
+            data != NULL &&
+            data->scenes_count > 0)
+        {
+            activeScene =
+                &data->scenes[0];
+        }
+
+        if (activeScene != NULL &&
+            activeScene->name != NULL &&
+            activeScene->name[0] != '\0')
+        {
+            ConvertUtf8ToTchar(
+                activeScene->name,
+                baseName,
+                _countof(baseName));
+        }
+    }
+
+    if (baseName[0] == _T('\0'))
+    {
+        _tcscpy_s(
+            baseName,
+            _countof(baseName),
+            _T("ImportedGLB"));
+    }
+
+    _stprintf_s(
+        outputName,
+        outputNameCount,
+        _T("Root:%s"),
+        baseName);
+}
+
+
+static BOOL CreateImportedParentNode(
+    cgltf_data* data,
+    const TCHAR* sourceFilename,
+    Interface* maxInterface,
+    MaxGLBImportStats* importStats,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (!g_activeImportSettings.addParentNode ||
+        importStats == NULL ||
+        importStats->createdNodes.size() <= 1)
+    {
+        return TRUE;
+    }
+
+    Object* dummyObject =
+        static_cast<Object*>(
+            CreateInstance(
+                HELPER_CLASS_ID,
+                Class_ID(DUMMY_CLASS_ID, 0)));
+
+    if (dummyObject == NULL)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create the requested parent Dummy helper."));
+        return FALSE;
+    }
+
+    INode* rootNode =
+        maxInterface->CreateObjectNode(
+            dummyObject);
+
+    if (rootNode == NULL)
+    {
+        dummyObject->DeleteThis();
+
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("3ds Max could not create the requested parent scene node."));
+        return FALSE;
+    }
+
+    rootNode->SetNodeTM(
+        maxInterface->GetTime(),
+        Matrix3(1));
+
+    TCHAR rootName[256];
+    BuildImportedRootName(
+        data,
+        sourceFilename,
+        rootName,
+        _countof(rootName));
+
+    rootNode->SetName(
+        rootName);
+
+    rootNode->SetWireColor(
+        RGB(255, 204, 64));
+
+    for (size_t nodeIndex = 0;
+         nodeIndex < importStats->createdNodes.size();
+         ++nodeIndex)
+    {
+        INode* childNode =
+            importStats->createdNodes[nodeIndex];
+
+        if (childNode != NULL &&
+            childNode != rootNode)
+        {
+            rootNode->AttachChild(
+                childNode,
+                1);
+        }
+    }
+
+    maxInterface->ClearNodeSelection(FALSE);
+    maxInterface->SelectNode(rootNode, FALSE);
+
+    importStats->createdParentNode =
+        TRUE;
+
+    return TRUE;
+}
+
+
 static BOOL ImportAllSceneMeshes(
     cgltf_data* data,
     const TCHAR* sourceFilename,
@@ -2945,6 +7619,17 @@ static BOOL ImportAllSceneMeshes(
         return FALSE;
     }
 
+    if (!CreateImportedParentNode(
+            data,
+            sourceFilename,
+            maxInterface,
+            importStats,
+            errorMessage,
+            errorMessageCount))
+    {
+        return FALSE;
+    }
+
     maxInterface->RedrawViews(
         maxInterface->GetTime());
 
@@ -2998,7 +7683,7 @@ public:
 
     unsigned int Version()
     {
-        return 100;
+        return 101;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -3205,10 +7890,65 @@ public:
             return IMPEXP_FAIL;
         }
 
+        MaxGLBImportSettings importSettings =
+            g_lastImportSettings;
+
+        if (!suppressPrompts)
+        {
+            if (!ShowMaxGLBImportOptions(
+                    parentWindow,
+                    filename,
+                    data,
+                    &importSettings))
+            {
+                cgltf_free(data);
+                free(fileBytes);
+                return IMPEXP_CANCEL;
+            }
+
+            g_lastImportSettings =
+                importSettings;
+        }
+
+        g_activeImportSettings =
+            importSettings;
+
+        g_activeImportSettings.appliedUniformScale =
+            1.0f;
+
+        g_activeImportData = data;
+        g_splitOrmImagesThisImport.clear();
+        g_unchangedImagesThisImport.clear();
+
         MaxGLBImportStats importStats;
 
         TCHAR importError[512];
         importError[0] = _T('\0');
+
+        if (g_activeImportSettings.normalizeSize &&
+            !ComputeNormalizedImportScale(
+                data,
+                g_activeImportSettings.rotationXDegrees,
+                g_activeImportSettings.normalizeTargetSize,
+                &g_activeImportSettings.appliedUniformScale))
+        {
+            g_activeImportData = NULL;
+            g_splitOrmImagesThisImport.clear();
+            g_unchangedImagesThisImport.clear();
+
+            cgltf_free(data);
+            free(fileBytes);
+
+            if (!suppressPrompts)
+            {
+                ShowImportMessage(
+                    parentWindow,
+                    _T("The model size could not be normalized because no valid geometry bounds were found."),
+                    MB_ICONERROR);
+            }
+
+            return IMPEXP_FAIL;
+        }
 
         BOOL importSucceeded =
             ImportAllSceneMeshes(
@@ -3218,6 +7958,10 @@ public:
                 &importStats,
                 importError,
                 _countof(importError));
+
+        g_activeImportData = NULL;
+        g_splitOrmImagesThisImport.clear();
+        g_unchangedImagesThisImport.clear();
 
         cgltf_free(data);
         free(fileBytes);
@@ -3262,8 +8006,14 @@ public:
                 _T("- every mesh node in the active scene is imported\n")
                 _T("- every triangle primitive becomes a Max object\n")
                 _T("- original node names are preserved\n")
-                _T("- full parent hierarchy is baked into geometry\n")
-                _T("- global scene rotation X = -90 degrees\n")
+                _T("- full source hierarchy transforms are baked into geometry\n")
+                _T("- standard glTF Y-up to Max Z-up conversion\n")
+                _T("- additional X correction: %.1f degrees\n")
+                _T("- textures imported: %s\n")
+                _T("- normalize size: %s\n")
+                _T("- requested largest dimension: %.3f\n")
+                _T("- applied uniform scale: %.6f\n")
+                _T("- Root parent created: %s\n")
                 _T("- TEXCOORD_0 imported to map channel 1\n")
                 _T("- duplicate POSITION vertices welded safely\n")
                 _T("- NORMAL imported as explicit Max normals"),
@@ -3277,7 +8027,19 @@ public:
                 importStats.baseColorTextures,
                 importStats.normalTextures,
                 importStats.ormTextures,
-                importStats.emissiveTextures);
+                importStats.emissiveTextures,
+                g_activeImportSettings.rotationXDegrees,
+                g_activeImportSettings.importTextures
+                    ? _T("yes")
+                    : _T("no"),
+                g_activeImportSettings.normalizeSize
+                    ? _T("yes")
+                    : _T("no"),
+                g_activeImportSettings.normalizeTargetSize,
+                g_activeImportSettings.appliedUniformScale,
+                importStats.createdParentNode
+                    ? _T("yes")
+                    : _T("no"));
 
             if (formatResult < 0)
             {
@@ -4823,6 +9585,7 @@ static unsigned char GetGrayValue(
 static BOOL CaptureMaterialMaps(
     INode* node,
     TimeValue timeValue,
+    BOOL exportTextures,
     MaxGLBExportMaterial* outputMaterial,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -4895,6 +9658,11 @@ static BOOL CaptureMaterialMaps(
     {
         outputMaterial->alphaBlend =
             TRUE;
+    }
+
+    if (!exportTextures)
+    {
+        return TRUE;
     }
 
     const std::string baseName =
@@ -5363,6 +10131,7 @@ static BOOL CaptureMaterialMaps(
 static BOOL TryBuildExportMesh(
     INode* node,
     TimeValue timeValue,
+    const MaxGLBExportSettings& settings,
     MaxGLBExportMesh* outputMesh,
     BOOL* outWasGeometry,
     TCHAR* errorMessage,
@@ -5439,9 +10208,11 @@ static BOOL TryBuildExportMesh(
             "MaxGLB_Mesh";
     }
 
-    if (!CaptureMaterialMaps(
+    if (settings.exportMaterials &&
+        !CaptureMaterialMaps(
             node,
             timeValue,
+            settings.exportTextures,
             &outputMesh->material,
             errorMessage,
             errorMessageCount))
@@ -5788,6 +10559,7 @@ static BOOL TryBuildExportMesh(
 static BOOL CollectSceneMeshesRecursive(
     INode* parentNode,
     TimeValue timeValue,
+    const MaxGLBExportSettings& settings,
     std::vector<MaxGLBExportMesh>& outputMeshes,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -5819,6 +10591,7 @@ static BOOL CollectSceneMeshesRecursive(
         if (!TryBuildExportMesh(
                 childNode,
                 timeValue,
+                settings,
                 &exportMesh,
                 &wasGeometry,
                 errorMessage,
@@ -5836,6 +10609,7 @@ static BOOL CollectSceneMeshesRecursive(
         if (!CollectSceneMeshesRecursive(
                 childNode,
                 timeValue,
+                settings,
                 outputMeshes,
                 errorMessage,
                 errorMessageCount))
@@ -5851,6 +10625,7 @@ static BOOL CollectSceneMeshesRecursive(
 static BOOL CollectMeshesForExport(
     Interface* maxInterface,
     BOOL selectedOnly,
+    const MaxGLBExportSettings& settings,
     std::vector<MaxGLBExportMesh>& outputMeshes,
     TCHAR* errorMessage,
     size_t errorMessageCount)
@@ -5895,6 +10670,7 @@ static BOOL CollectMeshesForExport(
             if (!TryBuildExportMesh(
                     selectedNode,
                     timeValue,
+                    settings,
                     &exportMesh,
                     &wasGeometry,
                     errorMessage,
@@ -5915,6 +10691,7 @@ static BOOL CollectMeshesForExport(
         if (!CollectSceneMeshesRecursive(
                 maxInterface->GetRootNode(),
                 timeValue,
+                settings,
                 outputMeshes,
                 errorMessage,
                 errorMessageCount))
@@ -5935,6 +10712,190 @@ static BOOL CollectMeshesForExport(
     }
 
     return TRUE;
+}
+
+
+
+static BOOL ApplyExportSizeSettings(
+    std::vector<MaxGLBExportMesh>& meshes,
+    MaxGLBExportSettings* settings,
+    TCHAR* errorMessage,
+    size_t errorMessageCount)
+{
+    if (settings == NULL ||
+        meshes.empty())
+    {
+        return TRUE;
+    }
+
+    float uniformScale =
+        settings->scaleFactor;
+
+    if (settings->normalizeSize)
+    {
+        BOOL boundsInitialized = FALSE;
+
+        float globalMinimum[3] =
+        {
+            0.0f,
+            0.0f,
+            0.0f
+        };
+
+        float globalMaximum[3] =
+        {
+            0.0f,
+            0.0f,
+            0.0f
+        };
+
+        for (size_t meshIndex = 0;
+             meshIndex < meshes.size();
+             ++meshIndex)
+        {
+            const MaxGLBExportMesh& mesh =
+                meshes[meshIndex];
+
+            if (!boundsInitialized)
+            {
+                for (int axisIndex = 0;
+                     axisIndex < 3;
+                     ++axisIndex)
+                {
+                    globalMinimum[axisIndex] =
+                        mesh.minimum[axisIndex];
+
+                    globalMaximum[axisIndex] =
+                        mesh.maximum[axisIndex];
+                }
+
+                boundsInitialized = TRUE;
+            }
+            else
+            {
+                for (int axisIndex = 0;
+                     axisIndex < 3;
+                     ++axisIndex)
+                {
+                    if (mesh.minimum[axisIndex] <
+                        globalMinimum[axisIndex])
+                    {
+                        globalMinimum[axisIndex] =
+                            mesh.minimum[axisIndex];
+                    }
+
+                    if (mesh.maximum[axisIndex] >
+                        globalMaximum[axisIndex])
+                    {
+                        globalMaximum[axisIndex] =
+                            mesh.maximum[axisIndex];
+                    }
+                }
+            }
+        }
+
+        float largestDimension = 0.0f;
+
+        for (int axisIndex = 0;
+             axisIndex < 3;
+             ++axisIndex)
+        {
+            const float dimension =
+                globalMaximum[axisIndex] -
+                globalMinimum[axisIndex];
+
+            if (dimension > largestDimension)
+            {
+                largestDimension =
+                    dimension;
+            }
+        }
+
+        if (largestDimension <= 1.0e-20f)
+        {
+            _tcscpy_s(
+                errorMessage,
+                errorMessageCount,
+                _T("The export bounds are too small to normalize."));
+            return FALSE;
+        }
+
+        uniformScale =
+            settings->normalizeTargetSize /
+            largestDimension;
+    }
+
+    if (!_finite(uniformScale) ||
+        uniformScale <= 0.0f)
+    {
+        _tcscpy_s(
+            errorMessage,
+            errorMessageCount,
+            _T("The calculated export scale is invalid."));
+        return FALSE;
+    }
+
+    for (size_t meshIndex = 0;
+         meshIndex < meshes.size();
+         ++meshIndex)
+    {
+        MaxGLBExportMesh& mesh =
+            meshes[meshIndex];
+
+        for (size_t positionIndex = 0;
+             positionIndex < mesh.positions.size();
+             ++positionIndex)
+        {
+            mesh.positions[positionIndex] *=
+                uniformScale;
+        }
+
+        for (int axisIndex = 0;
+             axisIndex < 3;
+             ++axisIndex)
+        {
+            mesh.minimum[axisIndex] *=
+                uniformScale;
+
+            mesh.maximum[axisIndex] *=
+                uniformScale;
+        }
+    }
+
+    settings->appliedUniformScale =
+        uniformScale;
+
+    return TRUE;
+}
+
+
+static void ShowExportedFileInExplorer(
+    const TCHAR* outputFilename)
+{
+    if (outputFilename == NULL ||
+        outputFilename[0] == _T('\0'))
+    {
+        return;
+    }
+
+    TCHAR parameters[4096];
+
+    if (_stprintf_s(
+            parameters,
+            _countof(parameters),
+            _T("/select,\"%s\""),
+            outputFilename) < 0)
+    {
+        return;
+    }
+
+    ShellExecute(
+        NULL,
+        _T("open"),
+        _T("explorer.exe"),
+        parameters,
+        NULL,
+        SW_SHOWNORMAL);
 }
 
 
@@ -6860,7 +11821,7 @@ public:
 
     unsigned int Version()
     {
-        return 104;
+        return 105;
     }
 
     void ShowAbout(HWND parentWindow)
@@ -6889,6 +11850,26 @@ public:
         const BOOL selectedOnly =
             (options & SCENE_EXPORT_SELECTED) != 0;
 
+        MaxGLBExportSettings exportSettings =
+            g_lastExportSettings;
+
+        if (!suppressPrompts)
+        {
+            if (!ShowMaxGLBExportOptions(
+                    maxInterface != NULL
+                        ? maxInterface->GetMAXHWnd()
+                        : NULL,
+                    outputFilename,
+                    selectedOnly,
+                    &exportSettings))
+            {
+                return IMPEXP_CANCEL;
+            }
+
+            g_lastExportSettings =
+                exportSettings;
+        }
+
         TCHAR errorMessage[1024];
         errorMessage[0] = _T('\0');
 
@@ -6897,7 +11878,13 @@ public:
         if (!CollectMeshesForExport(
                 maxInterface,
                 selectedOnly,
+                exportSettings,
                 meshes,
+                errorMessage,
+                _countof(errorMessage)) ||
+            !ApplyExportSizeSettings(
+                meshes,
+                &exportSettings,
                 errorMessage,
                 _countof(errorMessage)) ||
             !WriteGeometryGlbFile(
@@ -6989,14 +11976,15 @@ public:
             }
         }
 
-        if (!suppressPrompts)
+        if (!suppressPrompts &&
+            exportSettings.showSummary)
         {
-            TCHAR message[1200];
+            TCHAR message[1600];
 
             _stprintf_s(
                 message,
                 _countof(message),
-                _T("GLB geometry export completed.\n\n")
+                _T("GLB export completed.\n\n")
                 _T("Mode: %s\n")
                 _T("Meshes: %u\n")
                 _T("Export vertices: %u\n")
@@ -7009,27 +11997,18 @@ public:
                 _T("Exact imported ORM round-trips: %u\n")
                 _T("Emissive textures: %u\n")
                 _T("Alpha/opacity materials: %u\n\n")
-                _T("Included:\n")
+                _T("Export settings:\n")
+                _T("- size mode: %s\n")
+                _T("- applied uniform scale: %.7g\n")
+                _T("- materials: %s\n")
+                _T("- textures embedded in GLB: %s\n")
+                _T("- animation: not exported\n\n")
+                _T("Geometry:\n")
                 _T("- evaluated modifier stack\n")
                 _T("- object transforms baked into geometry\n")
                 _T("- Max Z-up converted to glTF Y-up\n")
-                _T("- indexed triangle geometry\n")
-                _T("- explicit and smoothing-group normals\n")
-                _T("- UV channel 1 as TEXCOORD_0\n")
-                _T("- identical position/normal/UV tuples reused\n")
-                _T("- hard edges and UV seams preserved\n")
-                _T("- Standard diffuse color as baseColorFactor\n")
-                _T("- diffuse/opacity merged into baseColor RGBA\n")
-                _T("- normal bitmap exported separately\n")
-                _T("- original imported ORM reused byte-for-byte when available\n")
-                _T("- otherwise ambient/glossiness/specular-level packed as ORM\n")
-                _T("- glossiness inverted to glTF roughness\n")
-                _T("- self-illumination bitmap exported as emissive\n")
-                _T("- opacity factor and alphaMode BLEND preserved\n\n")
-                _T("Current limits:\n")
-                _T("- direct BitmapTex maps only\n")
-                _T("- separate opacity map must match diffuse dimensions\n")
-                _T("- ORM source maps must share dimensions\n\n")
+                _T("- explicit normals and UV channel 1\n")
+                _T("- hard edges and UV seams preserved\n\n")
                 _T("Output:\n%s"),
                 selectedOnly
                     ? _T("Export Selected")
@@ -7056,6 +12035,16 @@ public:
                     exportedEmissiveTextures),
                 static_cast<unsigned int>(
                     alphaMaterials),
+                exportSettings.normalizeSize
+                    ? _T("normalize largest dimension")
+                    : _T("uniform scale factor"),
+                exportSettings.appliedUniformScale,
+                exportSettings.exportMaterials
+                    ? _T("yes")
+                    : _T("no"),
+                exportSettings.exportTextures
+                    ? _T("yes")
+                    : _T("no"),
                 outputFilename);
 
             MessageBox(
@@ -7065,6 +12054,12 @@ public:
                 message,
                 _T("MaxGLB2016 Export"),
                 MB_OK | MB_ICONINFORMATION);
+        }
+
+        if (exportSettings.showInExplorer)
+        {
+            ShowExportedFileInExplorer(
+                outputFilename);
         }
 
         return IMPEXP_SUCCESS;

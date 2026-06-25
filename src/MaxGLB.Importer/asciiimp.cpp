@@ -386,10 +386,72 @@ static const DWORD MAXGLB_TEXTURE_METADATA_MAGIC =
     0x54584D50u; // "TXMP"
 
 static const DWORD MAXGLB_TEXTURE_METADATA_VERSION =
-    1u;
+    3u;
 
 static const DWORD MAXGLB_TEXTURE_METADATA_SUB_ID =
     0x54585246u; // "TXRF"
+
+
+// Version 1 was used by the first Stage-13 importer build. Keep the
+// layout here so scenes imported with that build can still be exported.
+struct MaxGLBTextureMetadataV1
+{
+    DWORD magic;
+    DWORD version;
+
+    float offset[2];
+    float scale[2];
+    float rotation;
+
+    int texCoord;
+    int wrapS;
+    int wrapT;
+    int minFilter;
+    int magFilter;
+
+    float maxUOffset;
+    float maxVOffset;
+    float maxUScale;
+    float maxVScale;
+    float maxWAngle;
+
+    int maxMapChannel;
+    int maxTextureTiling;
+};
+
+
+// Version 2 added exact KHR_texture_transform round-trip fields.
+// Keep its binary layout so scenes saved with the Stage-13 build remain
+// readable after sampler/filter support is added.
+struct MaxGLBTextureMetadataV2
+{
+    DWORD magic;
+    DWORD version;
+
+    float offset[2];
+    float scale[2];
+    float rotation;
+
+    int texCoord;
+    int textureInfoTexCoord;
+    int transformHasTexCoord;
+    int transformTexCoord;
+    int hadTransformExtension;
+
+    int wrapS;
+    int wrapT;
+    int minFilter;
+    int magFilter;
+
+    float maxUOffset;
+    float maxVOffset;
+    float maxUScale;
+    float maxVScale;
+    float maxWAngle;
+
+    int maxMapChannel;
+    int maxTextureTiling;
+};
 
 
 struct MaxGLBTextureMetadata
@@ -401,7 +463,17 @@ struct MaxGLBTextureMetadata
     float scale[2];
     float rotation;
 
+    // Effective UV set after an optional KHR_texture_transform.texCoord
+    // override. This is the set that must exist on the exported primitive.
     int texCoord;
+
+    // Preserve the original textureInfo/extension structure as well as the
+    // effective value. This matters for exact import -> export round trips.
+    int textureInfoTexCoord;
+    int transformHasTexCoord;
+    int transformTexCoord;
+    int hadTransformExtension;
+
     int wrapS;
     int wrapT;
     int minFilter;
@@ -418,6 +490,11 @@ struct MaxGLBTextureMetadata
 
     int maxMapChannel;
     int maxTextureTiling;
+
+    // Max exposes one bitmap filter choice, while glTF stores independent
+    // minification and magnification filters. Keep the exact glTF pair in
+    // minFilter/magFilter and remember the Max approximation separately.
+    int maxFilterType;
 };
 
 
@@ -449,6 +526,59 @@ static int GetDefaultGltfWrapMode()
 }
 
 
+static int GltfSamplerToMaxFilterType(
+    int minFilter,
+    int magFilter)
+{
+    // Max 2016 offers one Bitmap filter switch, not independent glTF
+    // minification/magnification filters. Only the fully-nearest, non-mip
+    // pair has a direct Max equivalent. All linear or mipmapped modes use
+    // the normal pyramidal filter as the closest viewport/render match.
+    if (minFilter == 9728 && // NEAREST
+        magFilter == 9728)   // NEAREST
+    {
+        return FILTER_NADA;
+    }
+
+    return FILTER_PYR;
+}
+
+
+static void MaxFilterTypeToGltfSampler(
+    int maxFilterType,
+    int* outMinFilter,
+    int* outMagFilter)
+{
+    if (maxFilterType == FILTER_NADA)
+    {
+        if (outMinFilter != NULL)
+        {
+            *outMinFilter = 9728; // NEAREST
+        }
+
+        if (outMagFilter != NULL)
+        {
+            *outMagFilter = 9728; // NEAREST
+        }
+
+        return;
+    }
+
+    // Pyramidal and Summed Area both represent filtered sampling in Max.
+    // glTF has no Summed Area equivalent, so export a high-quality linear
+    // mipmapped pair for either edited Max setting.
+    if (outMinFilter != NULL)
+    {
+        *outMinFilter = GetDefaultGltfMinFilter();
+    }
+
+    if (outMagFilter != NULL)
+    {
+        *outMagFilter = GetDefaultGltfMagFilter();
+    }
+}
+
+
 // 3ds Max's legacy StdUVGen does not apply offset/scale/rotation with the
 // same pivot and operation order as KHR_texture_transform. To preserve the
 // exact glTF result, transformed UVs are baked into additional mesh map
@@ -461,11 +591,15 @@ struct MaxGLBBakedTextureChannel
     float offset[2];
     float scale[2];
     float rotation;
+    BOOL clampU;
+    BOOL clampV;
     int maxMapChannel;
 
     MaxGLBBakedTextureChannel()
         : sourceTexCoord(0)
         , rotation(0.0f)
+        , clampU(FALSE)
+        , clampV(FALSE)
         , maxMapChannel(0)
     {
         offset[0] = 0.0f;
@@ -544,6 +678,8 @@ static BOOL BakedTextureChannelsMatch(
 {
     return left.sourceTexCoord ==
             right.sourceTexCoord &&
+        left.clampU == right.clampU &&
+        left.clampV == right.clampV &&
         MaxGLBNearlyEqual(
             left.offset[0],
             right.offset[0]) &&
@@ -581,20 +717,52 @@ static void ApplyGltfTextureTransformToUv(
     const float scaledV =
         sourceV * transform.scale[1];
 
+    float transformedU =
+        transform.offset[0] +
+        cosine * scaledU +
+        sine * scaledV;
+
+    float transformedV =
+        transform.offset[1] -
+        sine * scaledU +
+        cosine * scaledV;
+
+    // Max's legacy Bitmap map treats disabled tiling as an empty/black
+    // region, not as glTF's CLAMP_TO_EDGE. For static imported geometry,
+    // bake out-of-range coordinates back to the edge while preserving the
+    // untouched TEXCOORD channels for exact round-trip export.
+    if (transform.clampU)
+    {
+        if (transformedU < 0.0f)
+        {
+            transformedU = 0.0f;
+        }
+        else if (transformedU > 1.0f)
+        {
+            transformedU = 1.0f - 1.0e-6f;
+        }
+    }
+
+    if (transform.clampV)
+    {
+        if (transformedV < 0.0f)
+        {
+            transformedV = 0.0f;
+        }
+        else if (transformedV > 1.0f)
+        {
+            transformedV = 1.0f - 1.0e-6f;
+        }
+    }
+
     if (outU != NULL)
     {
-        *outU =
-            transform.offset[0] +
-            cosine * scaledU +
-            sine * scaledV;
+        *outU = transformedU;
     }
 
     if (outV != NULL)
     {
-        *outV =
-            transform.offset[1] -
-            sine * scaledU +
-            cosine * scaledV;
+        *outV = transformedV;
     }
 }
 
@@ -657,8 +825,35 @@ static BOOL RegisterTextureViewMapChannel(
         return FALSE;
     }
 
+    const cgltf_sampler* sampler =
+        textureView->texture->sampler;
+
+    const int wrapS =
+        sampler != NULL &&
+        sampler->wrap_s != 0
+        ? static_cast<int>(
+            sampler->wrap_s)
+        : GetDefaultGltfWrapMode();
+
+    const int wrapT =
+        sampler != NULL &&
+        sampler->wrap_t != 0
+        ? static_cast<int>(
+            sampler->wrap_t)
+        : GetDefaultGltfWrapMode();
+
+    const BOOL clampU =
+        wrapS == static_cast<int>(
+            cgltf_wrap_mode_clamp_to_edge);
+
+    const BOOL clampV =
+        wrapT == static_cast<int>(
+            cgltf_wrap_mode_clamp_to_edge);
+
     if (!HasNonDefaultGltfTextureTransform(
-            textureView))
+            textureView) &&
+        !clampU &&
+        !clampV)
     {
         (*textureViewChannels)[textureView] =
             sourceTexCoord + 1;
@@ -671,25 +866,36 @@ static BOOL RegisterTextureViewMapChannel(
     candidate.sourceTexCoord =
         sourceTexCoord;
 
-    candidate.offset[0] =
-        static_cast<float>(
-            textureView->transform.offset[0]);
+    if (textureView->has_transform)
+    {
+        candidate.offset[0] =
+            static_cast<float>(
+                textureView->transform.offset[0]);
 
-    candidate.offset[1] =
-        static_cast<float>(
-            textureView->transform.offset[1]);
+        candidate.offset[1] =
+            static_cast<float>(
+                textureView->transform.offset[1]);
 
-    candidate.scale[0] =
-        static_cast<float>(
-            textureView->transform.scale[0]);
+        candidate.scale[0] =
+            static_cast<float>(
+                textureView->transform.scale[0]);
 
-    candidate.scale[1] =
-        static_cast<float>(
-            textureView->transform.scale[1]);
+        candidate.scale[1] =
+            static_cast<float>(
+                textureView->transform.scale[1]);
+    }
 
     candidate.rotation =
-        static_cast<float>(
-            textureView->transform.rotation);
+        textureView->has_transform
+        ? static_cast<float>(
+            textureView->transform.rotation)
+        : 0.0f;
+
+    candidate.clampU =
+        clampU;
+
+    candidate.clampV =
+        clampV;
 
     for (size_t channelIndex = 0;
          channelIndex < bakedChannels->size();
@@ -719,7 +925,7 @@ static BOOL RegisterTextureViewMapChannel(
         _tcscpy_s(
             errorMessage,
             errorMessageCount,
-            _T("The mesh requires too many unique texture transforms."));
+            _T("The mesh requires too many unique baked texture views."));
         return FALSE;
     }
 
@@ -872,28 +1078,124 @@ static BOOL ReadMaxGLBTextureMetadata(
 
     if (chunk == NULL ||
         chunk->data == NULL ||
-        chunk->length <
-            sizeof(MaxGLBTextureMetadata))
+        chunk->length < sizeof(DWORD) * 2)
     {
         return FALSE;
     }
 
-    const MaxGLBTextureMetadata* metadata =
-        static_cast<const MaxGLBTextureMetadata*>(
+    const DWORD* header =
+        static_cast<const DWORD*>(
             chunk->data);
 
-    if (metadata->magic !=
-            MAXGLB_TEXTURE_METADATA_MAGIC ||
-        metadata->version !=
-            MAXGLB_TEXTURE_METADATA_VERSION)
+    if (header[0] !=
+        MAXGLB_TEXTURE_METADATA_MAGIC)
     {
         return FALSE;
     }
 
-    *output =
-        *metadata;
+    if (header[1] ==
+            MAXGLB_TEXTURE_METADATA_VERSION &&
+        chunk->length >=
+            sizeof(MaxGLBTextureMetadata))
+    {
+        *output =
+            *static_cast<const MaxGLBTextureMetadata*>(
+                chunk->data);
 
-    return TRUE;
+        return TRUE;
+    }
+
+    if (header[1] == 2u &&
+        chunk->length >=
+            sizeof(MaxGLBTextureMetadataV2))
+    {
+        const MaxGLBTextureMetadataV2* legacy =
+            static_cast<const MaxGLBTextureMetadataV2*>(
+                chunk->data);
+
+        output->magic =
+            MAXGLB_TEXTURE_METADATA_MAGIC;
+
+        output->version =
+            MAXGLB_TEXTURE_METADATA_VERSION;
+
+        output->offset[0] = legacy->offset[0];
+        output->offset[1] = legacy->offset[1];
+        output->scale[0] = legacy->scale[0];
+        output->scale[1] = legacy->scale[1];
+        output->rotation = legacy->rotation;
+        output->texCoord = legacy->texCoord;
+        output->textureInfoTexCoord = legacy->textureInfoTexCoord;
+        output->transformHasTexCoord = legacy->transformHasTexCoord;
+        output->transformTexCoord = legacy->transformTexCoord;
+        output->hadTransformExtension = legacy->hadTransformExtension;
+        output->wrapS = legacy->wrapS;
+        output->wrapT = legacy->wrapT;
+        output->minFilter = legacy->minFilter;
+        output->magFilter = legacy->magFilter;
+        output->maxUOffset = legacy->maxUOffset;
+        output->maxVOffset = legacy->maxVOffset;
+        output->maxUScale = legacy->maxUScale;
+        output->maxVScale = legacy->maxVScale;
+        output->maxWAngle = legacy->maxWAngle;
+        output->maxMapChannel = legacy->maxMapChannel;
+        output->maxTextureTiling = legacy->maxTextureTiling;
+
+        // Stage 13 did not explicitly set Bitmap filtering, so the normal
+        // Max default (Pyramidal) is the correct snapshot for old scenes.
+        output->maxFilterType = FILTER_PYR;
+
+        return TRUE;
+    }
+
+    if (header[1] == 1u &&
+        chunk->length >=
+            sizeof(MaxGLBTextureMetadataV1))
+    {
+        const MaxGLBTextureMetadataV1* legacy =
+            static_cast<const MaxGLBTextureMetadataV1*>(
+                chunk->data);
+
+        output->magic =
+            MAXGLB_TEXTURE_METADATA_MAGIC;
+
+        output->version =
+            MAXGLB_TEXTURE_METADATA_VERSION;
+
+        output->offset[0] = legacy->offset[0];
+        output->offset[1] = legacy->offset[1];
+        output->scale[0] = legacy->scale[0];
+        output->scale[1] = legacy->scale[1];
+        output->rotation = legacy->rotation;
+        output->texCoord = legacy->texCoord;
+        output->textureInfoTexCoord = legacy->texCoord;
+        output->transformHasTexCoord = FALSE;
+        output->transformTexCoord = legacy->texCoord;
+
+        output->hadTransformExtension =
+            !MaxGLBNearlyEqual(legacy->offset[0], 0.0f) ||
+            !MaxGLBNearlyEqual(legacy->offset[1], 0.0f) ||
+            !MaxGLBNearlyEqual(legacy->scale[0], 1.0f) ||
+            !MaxGLBNearlyEqual(legacy->scale[1], 1.0f) ||
+            !MaxGLBNearlyEqual(legacy->rotation, 0.0f);
+
+        output->wrapS = legacy->wrapS;
+        output->wrapT = legacy->wrapT;
+        output->minFilter = legacy->minFilter;
+        output->magFilter = legacy->magFilter;
+        output->maxUOffset = legacy->maxUOffset;
+        output->maxVOffset = legacy->maxVOffset;
+        output->maxUScale = legacy->maxUScale;
+        output->maxVScale = legacy->maxVScale;
+        output->maxWAngle = legacy->maxWAngle;
+        output->maxMapChannel = legacy->maxMapChannel;
+        output->maxTextureTiling = legacy->maxTextureTiling;
+        output->maxFilterType = FILTER_PYR;
+
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 
@@ -913,8 +1215,10 @@ static int GltfWrapModeToMaxTilingFlags(
         static_cast<int>(
             cgltf_wrap_mode_mirrored_repeat))
     {
-        flags |= U_WRAP |
-            U_MIRROR;
+        // In StdUVGen, Mirror is its own tiling mode. Combining U_WRAP and
+        // U_MIRROR makes Max 2016 behave like normal repeat in viewport and
+        // scanline rendering.
+        flags |= U_MIRROR;
     }
 
     if (wrapT ==
@@ -927,8 +1231,7 @@ static int GltfWrapModeToMaxTilingFlags(
         static_cast<int>(
             cgltf_wrap_mode_mirrored_repeat))
     {
-        flags |= V_WRAP |
-            V_MIRROR;
+        flags |= V_MIRROR;
     }
 
     return flags;
@@ -1065,6 +1368,14 @@ static BOOL ApplyGltfTextureViewToBitmap(
             sampler->mag_filter)
         : GetDefaultGltfMagFilter();
 
+    const int maxFilterType =
+        GltfSamplerToMaxFilterType(
+            minFilter,
+            magFilter);
+
+    bitmap->SetFilterType(
+        maxFilterType);
+
     int maxMapChannel =
         gltfTexCoord + 1;
 
@@ -1081,11 +1392,14 @@ static BOOL ApplyGltfTextureViewToBitmap(
             channelIterator->second;
     }
     else if (HasNonDefaultGltfTextureTransform(
-                 textureView))
+                 textureView) ||
+             wrapS == static_cast<int>(
+                 cgltf_wrap_mode_clamp_to_edge) ||
+             wrapT == static_cast<int>(
+                 cgltf_wrap_mode_clamp_to_edge))
     {
-        // A non-default glTF transform must have been baked into the mesh
-        // before the material is created. Falling back to StdUVGen would
-        // reintroduce Max's different pivot/order semantics.
+        // Non-default glTF transforms and CLAMP_TO_EDGE are baked into a
+        // dedicated Max map channel before the material is created.
         return FALSE;
     }
 
@@ -1095,9 +1409,9 @@ static BOOL ApplyGltfTextureViewToBitmap(
     uvGenerator->SetMapChannel(
         maxMapChannel);
 
-    // KHR_texture_transform is already baked into maxMapChannel. Keep the
-    // legacy Bitmap coordinates at identity so both viewport and renderer
-    // read the exact transformed UVs.
+    // KHR_texture_transform and any required CLAMP_TO_EDGE correction are
+    // already baked into maxMapChannel. Keep legacy Bitmap coordinates at
+    // identity so viewport and renderer use the same UVs.
     uvGenerator->SetUScl(
         1.0f,
         timeValue);
@@ -1155,6 +1469,23 @@ static BOOL ApplyGltfTextureViewToBitmap(
     metadata.texCoord =
         gltfTexCoord;
 
+    metadata.textureInfoTexCoord =
+        textureView->texcoord < 0
+        ? 0
+        : textureView->texcoord;
+
+    metadata.transformHasTexCoord =
+        textureView->has_transform &&
+        textureView->transform.has_texcoord;
+
+    metadata.transformTexCoord =
+        metadata.transformHasTexCoord
+        ? textureView->transform.texcoord
+        : gltfTexCoord;
+
+    metadata.hadTransformExtension =
+        textureView->has_transform;
+
     metadata.wrapS =
         wrapS;
 
@@ -1187,6 +1518,9 @@ static BOOL ApplyGltfTextureViewToBitmap(
 
     metadata.maxTextureTiling =
         maxTiling;
+
+    metadata.maxFilterType =
+        maxFilterType;
 
     StoreMaxGLBTextureMetadata(
         bitmap,
@@ -3525,6 +3859,14 @@ static BOOL CreateStandardMaterialForPrimitive(
             _T("MaxGLB2016_Material_0"));
     }
 
+    // glTF materials are single-sided by default. The Standard material's
+    // Two-Sided flag is the direct Max 2016 equivalent and is already read
+    // back by the exporter through GetTwoSided().
+    maxMaterial->SetTwoSided(
+        gltfMaterial->double_sided
+        ? TRUE
+        : FALSE);
+
     const TimeValue timeValue =
         maxInterface != NULL
         ? maxInterface->GetTime()
@@ -4230,6 +4572,7 @@ static void ConvertUtf8ToTchar(
 #define MAXGLB_ID_EXPORT_ALPHA_CUTOFF      4213
 #define MAXGLB_ID_EXPORT_TRANSFORM_MODE     4214
 #define MAXGLB_ID_EXPORT_HIERARCHY          4215
+#define MAXGLB_ID_EXPORT_TRANSFORM_FOLDOUT   4216
 
 
 struct MaxGLBImportDialogContext
@@ -7536,15 +7879,29 @@ struct MaxGLBExportDialogContext
     HWND scaleEdit;
     HWND normalizeCheck;
     HWND normalizeTargetEdit;
+
+    HWND transformFoldoutButton;
     HWND transformModeCombo;
+    HWND transformHelpLabel;
     HWND hierarchyCheck;
+
+    HWND materialsLabel;
     HWND materialsCheck;
     HWND texturesCheck;
+    HWND alphaModeLabel;
     HWND alphaModeCombo;
+    HWND alphaCutoffLabel;
     HWND alphaCutoffEdit;
+    HWND geometryInfoLabel;
+
+    HWND afterExportLabel;
     HWND summaryCheck;
     HWND explorerCheck;
     HWND animationCheck;
+
+    HWND infoButton;
+    HWND cancelButton;
+    HWND exportButton;
 
     const TCHAR* outputFilename;
     BOOL selectedOnly;
@@ -7553,6 +7910,7 @@ struct MaxGLBExportDialogContext
 
     BOOL accepted;
     BOOL closed;
+    BOOL transformsExpanded;
 
     MaxGLBExportDialogContext()
         : parentWindow(NULL)
@@ -7560,19 +7918,30 @@ struct MaxGLBExportDialogContext
         , scaleEdit(NULL)
         , normalizeCheck(NULL)
         , normalizeTargetEdit(NULL)
+        , transformFoldoutButton(NULL)
         , transformModeCombo(NULL)
+        , transformHelpLabel(NULL)
         , hierarchyCheck(NULL)
+        , materialsLabel(NULL)
         , materialsCheck(NULL)
         , texturesCheck(NULL)
+        , alphaModeLabel(NULL)
         , alphaModeCombo(NULL)
+        , alphaCutoffLabel(NULL)
         , alphaCutoffEdit(NULL)
+        , geometryInfoLabel(NULL)
+        , afterExportLabel(NULL)
         , summaryCheck(NULL)
         , explorerCheck(NULL)
         , animationCheck(NULL)
+        , infoButton(NULL)
+        , cancelButton(NULL)
+        , exportButton(NULL)
         , outputFilename(NULL)
         , selectedOnly(FALSE)
         , accepted(FALSE)
         , closed(FALSE)
+        , transformsExpanded(FALSE)
     {
     }
 };
@@ -7596,7 +7965,225 @@ static BOOL IsExportPushButtonId(
 {
     return controlId == MAXGLB_ID_EXPORT_INFO ||
         controlId == MAXGLB_ID_EXPORT_CANCEL ||
-        controlId == MAXGLB_ID_EXPORT_CONFIRM;
+        controlId == MAXGLB_ID_EXPORT_CONFIRM ||
+        controlId == MAXGLB_ID_EXPORT_TRANSFORM_FOLDOUT;
+}
+
+
+static const int MAXGLB_EXPORT_CLIENT_WIDTH = 536;
+static const int MAXGLB_EXPORT_EXPANDED_CLIENT_HEIGHT = 610;
+static const int MAXGLB_EXPORT_COLLAPSED_CLIENT_HEIGHT = 522;
+static const int MAXGLB_EXPORT_COLLAPSED_Y_OFFSET = -88;
+
+
+static void SetExportControlBounds(
+    HWND control,
+    int x,
+    int y,
+    int width,
+    int height)
+{
+    if (control == NULL)
+    {
+        return;
+    }
+
+    SetWindowPos(
+        control,
+        NULL,
+        x,
+        y,
+        width,
+        height,
+        SWP_NOZORDER |
+        SWP_NOACTIVATE);
+}
+
+
+static void ResizeExportDialogClient(
+    HWND window,
+    int clientHeight)
+{
+    if (window == NULL)
+    {
+        return;
+    }
+
+    RECT windowRect =
+    {
+        0,
+        0,
+        MAXGLB_EXPORT_CLIENT_WIDTH,
+        clientHeight
+    };
+
+    AdjustWindowRectEx(
+        &windowRect,
+        WS_CAPTION |
+        WS_SYSMENU |
+        WS_POPUP,
+        FALSE,
+        WS_EX_DLGMODALFRAME |
+        WS_EX_CONTROLPARENT);
+
+    SetWindowPos(
+        window,
+        NULL,
+        0,
+        0,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
+        SWP_NOMOVE |
+        SWP_NOZORDER |
+        SWP_NOACTIVATE);
+}
+
+
+static void UpdateExportTransformFoldoutLayout(
+    MaxGLBExportDialogContext* context)
+{
+    if (context == NULL ||
+        context->window == NULL)
+    {
+        return;
+    }
+
+    const BOOL expanded =
+        context->transformsExpanded;
+
+    TCHAR foldoutCaption[160];
+
+    if (expanded)
+    {
+        _tcscpy_s(
+            foldoutCaption,
+            _countof(foldoutCaption),
+            _T("- Advanced transforms and hierarchy"));
+    }
+    else
+    {
+        const int selectedTransformMode =
+            context->transformModeCombo != NULL
+            ? static_cast<int>(
+                SendMessage(
+                    context->transformModeCombo,
+                    CB_GETCURSEL,
+                    0,
+                    0))
+            : MAXGLB_TRANSFORM_BAKE;
+
+        if (selectedTransformMode ==
+            MAXGLB_TRANSFORM_PRESERVE)
+        {
+            _stprintf_s(
+                foldoutCaption,
+                _countof(foldoutCaption),
+                _T("+ Advanced transforms: preserve pivots%s"),
+                GetImportCheckboxState(
+                    context->hierarchyCheck)
+                ? _T(" + hierarchy")
+                : _T(""));
+        }
+        else
+        {
+            _tcscpy_s(
+                foldoutCaption,
+                _countof(foldoutCaption),
+                _T("+ Advanced transforms: bake into geometry (recommended)"));
+        }
+    }
+
+    SetWindowText(
+        context->transformFoldoutButton,
+        foldoutCaption);
+
+    ShowWindow(
+        context->transformModeCombo,
+        expanded ? SW_SHOW : SW_HIDE);
+
+    ShowWindow(
+        context->transformHelpLabel,
+        expanded ? SW_SHOW : SW_HIDE);
+
+    ShowWindow(
+        context->hierarchyCheck,
+        expanded ? SW_SHOW : SW_HIDE);
+
+    const int yOffset =
+        expanded
+        ? 0
+        : MAXGLB_EXPORT_COLLAPSED_Y_OFFSET;
+
+    SetExportControlBounds(
+        context->materialsLabel,
+        16, 300 + yOffset, 180, 20);
+
+    SetExportControlBounds(
+        context->materialsCheck,
+        27, 328 + yOffset, 250, 26);
+
+    SetExportControlBounds(
+        context->texturesCheck,
+        27, 358 + yOffset, 300, 26);
+
+    SetExportControlBounds(
+        context->alphaModeLabel,
+        315, 300 + yOffset, 190, 20);
+
+    SetExportControlBounds(
+        context->alphaModeCombo,
+        315, 326 + yOffset, 200, 120);
+
+    SetExportControlBounds(
+        context->alphaCutoffLabel,
+        315, 358 + yOffset, 90, 20);
+
+    SetExportControlBounds(
+        context->alphaCutoffEdit,
+        410, 355 + yOffset, 80, 24);
+
+    SetExportControlBounds(
+        context->geometryInfoLabel,
+        28, 390 + yOffset, 470, 36);
+
+    SetExportControlBounds(
+        context->afterExportLabel,
+        16, 436 + yOffset, 180, 20);
+
+    SetExportControlBounds(
+        context->summaryCheck,
+        27, 462 + yOffset, 230, 26);
+
+    SetExportControlBounds(
+        context->explorerCheck,
+        27, 492 + yOffset, 330, 26);
+
+    SetExportControlBounds(
+        context->animationCheck,
+        27, 522 + yOffset, 300, 26);
+
+    SetExportControlBounds(
+        context->infoButton,
+        16, 566 + yOffset, 80, 29);
+
+    SetExportControlBounds(
+        context->cancelButton,
+        350, 566 + yOffset, 80, 29);
+
+    SetExportControlBounds(
+        context->exportButton,
+        440, 566 + yOffset, 80, 29);
+
+    ResizeExportDialogClient(
+        context->window,
+        expanded
+        ? MAXGLB_EXPORT_EXPANDED_CLIENT_HEIGHT
+        : MAXGLB_EXPORT_COLLAPSED_CLIENT_HEIGHT);
+
+    InvalidateRect(
+        context->window,
+        NULL,
+        TRUE);
 }
 
 
@@ -7918,19 +8505,22 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 -1,
                 NULL);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Transforms and pivots"),
-                WS_CHILD |
-                WS_VISIBLE,
-                16,
-                176,
-                220,
-                20,
-                window,
-                -1,
-                NULL);
+            context->transformFoldoutButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("+ Advanced transforms and hierarchy"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    16,
+                    176,
+                    500,
+                    24,
+                    window,
+                    MAXGLB_ID_EXPORT_TRANSFORM_FOLDOUT,
+                    NULL);
 
             context->transformModeCombo =
                 CreateImportControl(
@@ -7970,19 +8560,20 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->settings.transformMode,
                 0);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Preserve keeps local mesh coordinates and writes each Max pivot/world transform as a glTF node matrix."),
-                WS_CHILD |
-                WS_VISIBLE,
-                27,
-                232,
-                485,
-                32,
-                window,
-                -1,
-                NULL);
+            context->transformHelpLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("Preserve keeps local mesh coordinates and writes each Max pivot/world transform as a glTF node matrix."),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    27,
+                    232,
+                    485,
+                    32,
+                    window,
+                    -1,
+                    NULL);
 
             context->hierarchyCheck =
                 CreateImportControl(
@@ -8008,19 +8599,20 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->hierarchyCheck,
                 context->settings.preserveHierarchy);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Materials"),
-                WS_CHILD |
-                WS_VISIBLE,
-                16,
-                300,
-                180,
-                20,
-                window,
-                -1,
-                NULL);
+            context->materialsLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("Materials"),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    16,
+                    300,
+                    180,
+                    20,
+                    window,
+                    -1,
+                    NULL);
 
             context->materialsCheck =
                 CreateImportControl(
@@ -8064,14 +8656,15 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->texturesCheck,
                 context->settings.exportTextures);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Alpha mode"),
-                WS_CHILD |
-                WS_VISIBLE,
-                315,
-                300,
+            context->alphaModeLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("Alpha mode"),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    315,
+                    300,
                 190,
                 20,
                 window,
@@ -8130,14 +8723,15 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->settings.alphaMode,
                 0);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Mask cutoff"),
-                WS_CHILD |
-                WS_VISIBLE,
-                315,
-                358,
+            context->alphaCutoffLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("Mask cutoff"),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    315,
+                    358,
                 90,
                 20,
                 window,
@@ -8172,28 +8766,30 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
             UseReadableClassicTheme(
                 context->alphaCutoffEdit);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("Geometry is always triangulated; modifier stacks, transforms, normals and UV channel 1 are exported automatically."),
-                WS_CHILD |
-                WS_VISIBLE,
-                28,
-                390,
+            context->geometryInfoLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("Geometry is always triangulated; modifier stacks, transforms, normals and UV channels 1/2 are exported automatically."),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    28,
+                    390,
                 470,
                 36,
                 window,
                 -1,
                 NULL);
 
-            CreateImportControl(
-                0,
-                _T("STATIC"),
-                _T("After export"),
-                WS_CHILD |
-                WS_VISIBLE,
-                16,
-                436,
+            context->afterExportLabel =
+                CreateImportControl(
+                    0,
+                    _T("STATIC"),
+                    _T("After export"),
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    16,
+                    436,
                 180,
                 20,
                 window,
@@ -8266,48 +8862,51 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 context->animationCheck,
                 FALSE);
 
-            CreateImportControl(
-                0,
-                _T("BUTTON"),
-                _T("Info"),
-                WS_CHILD |
-                WS_VISIBLE |
-                WS_TABSTOP |
-                BS_OWNERDRAW,
-                16,
-                566,
-                80,
-                29,
-                window,
-                MAXGLB_ID_EXPORT_INFO,
-                NULL);
+            context->infoButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Info"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    16,
+                    566,
+                    80,
+                    29,
+                    window,
+                    MAXGLB_ID_EXPORT_INFO,
+                    NULL);
 
-            CreateImportControl(
-                0,
-                _T("BUTTON"),
-                _T("Cancel"),
-                WS_CHILD |
-                WS_VISIBLE |
-                WS_TABSTOP |
-                BS_OWNERDRAW,
-                350,
-                566,
-                80,
-                29,
-                window,
-                MAXGLB_ID_EXPORT_CANCEL,
-                NULL);
+            context->cancelButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Cancel"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    350,
+                    566,
+                    80,
+                    29,
+                    window,
+                    MAXGLB_ID_EXPORT_CANCEL,
+                    NULL);
 
-            CreateImportControl(
-                0,
-                _T("BUTTON"),
-                _T("Export"),
-                WS_CHILD |
-                WS_VISIBLE |
-                WS_TABSTOP |
-                BS_OWNERDRAW,
-                440,
-                566,
+            context->exportButton =
+                CreateImportControl(
+                    0,
+                    _T("BUTTON"),
+                    _T("Export"),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_OWNERDRAW,
+                    440,
+                    566,
                 80,
                 29,
                 window,
@@ -8319,6 +8918,9 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
                 DM_SETDEFID,
                 MAXGLB_ID_EXPORT_CONFIRM,
                 0);
+
+            UpdateExportTransformFoldoutLayout(
+                context);
 
             UpdateExportDialogEnabledState(
                 context);
@@ -8439,6 +9041,22 @@ static LRESULT CALLBACK MaxGLBExportWindowProcedure(
 
             const int notificationCode =
                 HIWORD(wordParameter);
+
+            if (controlId ==
+                    MAXGLB_ID_EXPORT_TRANSFORM_FOLDOUT &&
+                notificationCode == BN_CLICKED)
+            {
+                context->transformsExpanded =
+                    !context->transformsExpanded;
+
+                UpdateExportTransformFoldoutLayout(
+                    context);
+
+                UpdateExportDialogEnabledState(
+                    context);
+
+                return 0;
+            }
 
             if ((controlId == MAXGLB_ID_EXPORT_NORMALIZE ||
                  controlId == MAXGLB_ID_EXPORT_HIERARCHY ||
@@ -8742,8 +9360,11 @@ static BOOL ShowMaxGLBExportOptions(
     context.settings =
         *settings;
 
-    const int clientWidth = 536;
-    const int clientHeight = 610;
+    const int clientWidth =
+        MAXGLB_EXPORT_CLIENT_WIDTH;
+
+    const int clientHeight =
+        MAXGLB_EXPORT_COLLAPSED_CLIENT_HEIGHT;
 
     RECT windowRect =
     {
@@ -9614,7 +10235,7 @@ static BOOL ImportPrimitiveAsNode(
                 _stprintf_s(
                     errorMessage,
                     errorMessageCount,
-                    _T("A baked texture transform requires TEXCOORD_%d, but the primitive does not contain it."),
+                    _T("A baked texture view requires TEXCOORD_%d, but the primitive does not contain it."),
                     bakedChannel.sourceTexCoord);
                 return FALSE;
             }
@@ -9632,7 +10253,7 @@ static BOOL ImportPrimitiveAsNode(
                 _tcscpy_s(
                     errorMessage,
                     errorMessageCount,
-                    _T("A texture coordinate could not be read while baking KHR_texture_transform."));
+                    _T("A texture coordinate could not be read while baking texture settings."));
                 return FALSE;
             }
 
@@ -9826,7 +10447,7 @@ static BOOL ImportPrimitiveAsNode(
                 _tcscpy_s(
                     errorMessage,
                     errorMessageCount,
-                    _T("3ds Max could not access a baked texture-transform map channel."));
+                    _T("3ds Max could not access a baked texture-view map channel."));
                 return FALSE;
             }
 
@@ -9973,6 +10594,18 @@ static BOOL ImportPrimitiveAsNode(
         maxNode->SetMtl(importedMaterial);
         AppendMaterialImportLog(_T("13: material assigned to node"));
     }
+
+    // Scanline honors StdMat::SetTwoSided(), while the Max 2016 Nitrous
+    // viewport also consults the node's Backface Cull display property.
+    // Keep both in sync for the common one-primitive-per-node path.
+    const BOOL isDoubleSided =
+        primitive->material != NULL &&
+        primitive->material->double_sided;
+
+    maxNode->BackCull(
+        isDoubleSided
+        ? FALSE
+        : TRUE);
 
     importStats->createdNodes.push_back(
         maxNode);
@@ -10846,7 +11479,7 @@ static BOOL ImportMeshPrimitivesAsNode(
                         _tcscpy_s(
                             errorMessage,
                             errorMessageCount,
-                            _T("A texture coordinate could not be read while baking KHR_texture_transform."));
+                            _T("A texture coordinate could not be read while baking texture settings."));
                         return FALSE;
                     }
 
@@ -11091,7 +11724,7 @@ static BOOL ImportMeshPrimitivesAsNode(
                     _tcscpy_s(
                         errorMessage,
                         errorMessageCount,
-                        _T("3ds Max could not access a baked texture-transform map channel."));
+                        _T("3ds Max could not access a baked texture-view map channel."));
                     return FALSE;
                 }
 
@@ -12531,7 +13164,16 @@ struct MaxGLBExportTextureViewData
     float scale[2];
     float rotation;
 
+    // Effective texCoord used for validation and primitive UV requirements.
     int texCoord;
+
+    // Original textureInfo texCoord plus an optional
+    // KHR_texture_transform.texCoord override for exact round trips.
+    int textureInfoTexCoord;
+    BOOL transformHasTexCoord;
+    int transformTexCoord;
+    BOOL preserveTransformExtension;
+
     int wrapS;
     int wrapT;
     int minFilter;
@@ -12542,6 +13184,10 @@ struct MaxGLBExportTextureViewData
         , hasTransform(FALSE)
         , rotation(0.0f)
         , texCoord(0)
+        , textureInfoTexCoord(0)
+        , transformHasTexCoord(FALSE)
+        , transformTexCoord(0)
+        , preserveTransformExtension(FALSE)
         , wrapS(10497)
         , wrapT(10497)
         , minFilter(9987)
@@ -14060,6 +14706,9 @@ static BOOL CaptureBitmapTextureView(
     const int maxTextureTiling =
         uvGenerator->GetTextureTiling();
 
+    const int maxFilterType =
+        bitmap->GetFilterType();
+
     MaxGLBTextureMetadata importedMetadata;
 
     const BOOL hasImportedMetadata =
@@ -14067,7 +14716,17 @@ static BOOL CaptureBitmapTextureView(
             bitmap,
             &importedMetadata);
 
-    const BOOL importedValuesUnchanged =
+    const BOOL importedFilterUnchanged =
+        hasImportedMetadata &&
+        maxFilterType ==
+            importedMetadata.maxFilterType;
+
+    const BOOL importedTilingUnchanged =
+        hasImportedMetadata &&
+        maxTextureTiling ==
+            importedMetadata.maxTextureTiling;
+
+    const BOOL importedCoordinatesUnchanged =
         hasImportedMetadata &&
         MaxGLBNearlyEqual(
             maxUOffset,
@@ -14085,12 +14744,12 @@ static BOOL CaptureBitmapTextureView(
             maxWAngle,
             importedMetadata.maxWAngle) &&
         maxMapChannel ==
-            importedMetadata.maxMapChannel &&
-        maxTextureTiling ==
-            importedMetadata.maxTextureTiling;
+            importedMetadata.maxMapChannel;
 
-    if (importedValuesUnchanged)
+    if (importedCoordinatesUnchanged)
     {
+        // Keep the original transform/texCoord structure. Sampler wrapping
+        // and filtering may still be edited independently in Max.
         output->offset[0] =
             importedMetadata.offset[0];
 
@@ -14109,17 +14768,45 @@ static BOOL CaptureBitmapTextureView(
         output->texCoord =
             importedMetadata.texCoord;
 
+        output->textureInfoTexCoord =
+            importedMetadata.textureInfoTexCoord;
+
+        output->transformHasTexCoord =
+            importedMetadata.transformHasTexCoord;
+
+        output->transformTexCoord =
+            importedMetadata.transformTexCoord;
+
+        output->preserveTransformExtension =
+            importedMetadata.hadTransformExtension;
+
         output->wrapS =
-            importedMetadata.wrapS;
+            importedTilingUnchanged
+            ? importedMetadata.wrapS
+            : MaxTilingFlagsToGltfWrapS(
+                maxTextureTiling);
 
         output->wrapT =
-            importedMetadata.wrapT;
+            importedTilingUnchanged
+            ? importedMetadata.wrapT
+            : MaxTilingFlagsToGltfWrapT(
+                maxTextureTiling);
 
-        output->minFilter =
-            importedMetadata.minFilter;
+        if (importedFilterUnchanged)
+        {
+            output->minFilter =
+                importedMetadata.minFilter;
 
-        output->magFilter =
-            importedMetadata.magFilter;
+            output->magFilter =
+                importedMetadata.magFilter;
+        }
+        else
+        {
+            MaxFilterTypeToGltfSampler(
+                maxFilterType,
+                &output->minFilter,
+                &output->magFilter);
+        }
     }
     else
     {
@@ -14174,6 +14861,18 @@ static BOOL CaptureBitmapTextureView(
         output->texCoord =
             maxMapChannel - 1;
 
+        output->textureInfoTexCoord =
+            output->texCoord;
+
+        output->transformHasTexCoord =
+            FALSE;
+
+        output->transformTexCoord =
+            output->texCoord;
+
+        output->preserveTransformExtension =
+            FALSE;
+
         output->wrapS =
             MaxTilingFlagsToGltfWrapS(
                 maxTextureTiling);
@@ -14182,21 +14881,29 @@ static BOOL CaptureBitmapTextureView(
             MaxTilingFlagsToGltfWrapT(
                 maxTextureTiling);
 
-        // Max 2016 exposes one bitmap filter choice rather than separate
-        // glTF min/mag filters. Preserve imported filters when available;
-        // otherwise use high-quality linear defaults.
-        output->minFilter =
-            hasImportedMetadata
-            ? importedMetadata.minFilter
-            : GetDefaultGltfMinFilter();
+        // Preserve the exact original glTF filter pair while the artist has
+        // not changed Max's approximate Bitmap filter. If it was edited,
+        // convert the current Max choice to a deterministic glTF pair.
+        if (importedFilterUnchanged)
+        {
+            output->minFilter =
+                importedMetadata.minFilter;
 
-        output->magFilter =
-            hasImportedMetadata
-            ? importedMetadata.magFilter
-            : GetDefaultGltfMagFilter();
+            output->magFilter =
+                importedMetadata.magFilter;
+        }
+        else
+        {
+            MaxFilterTypeToGltfSampler(
+                maxFilterType,
+                &output->minFilter,
+                &output->magFilter);
+        }
     }
 
     output->hasTransform =
+        output->preserveTransformExtension ||
+        output->transformHasTexCoord ||
         !IsDefaultTextureTransform(
             *output);
 
@@ -14217,11 +14924,11 @@ static void WriteGltfTextureInfo(
         << "\"index\":"
         << textureIndex;
 
-    if (view.texCoord != 0)
+    if (view.textureInfoTexCoord != 0)
     {
         json
             << ",\"texCoord\":"
-            << view.texCoord;
+            << view.textureInfoTexCoord;
     }
 
     if (view.hasTransform)
@@ -14237,7 +14944,16 @@ static void WriteGltfTextureInfo(
             << ",\"scale\":["
             << view.scale[0] << ","
             << view.scale[1]
-            << "]"
+            << "]";
+
+        if (view.transformHasTexCoord)
+        {
+            json
+                << ",\"texCoord\":"
+                << view.transformTexCoord;
+        }
+
+        json
             << "}"
             << "}";
     }

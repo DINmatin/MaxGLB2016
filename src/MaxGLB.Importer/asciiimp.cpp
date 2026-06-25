@@ -392,6 +392,16 @@ static const DWORD MAXGLB_TEXTURE_METADATA_SUB_ID =
     0x54585246u; // "TXRF"
 
 
+static const DWORD MAXGLB_TRANSMISSION_METADATA_MAGIC =
+    0x54524E53u; // "TRNS"
+
+static const DWORD MAXGLB_TRANSMISSION_METADATA_VERSION =
+    1u;
+
+static const DWORD MAXGLB_TRANSMISSION_METADATA_SUB_ID =
+    0x54524E53u; // "TRNS"
+
+
 // Version 1 was used by the first Stage-13 importer build. Keep the
 // layout here so scenes imported with that build can still be exported.
 struct MaxGLBTextureMetadataV1
@@ -1690,6 +1700,163 @@ static BOOL ReadMaxGLBAlphaMetadata(
         *outFlags =
             metadata->flags;
     }
+
+    return TRUE;
+}
+
+
+struct MaxGLBTransmissionMetadata
+{
+    DWORD magic;
+    DWORD version;
+    int hadExtension;
+    float transmissionFactor;
+    float maxOpacity;
+};
+
+
+static float ClampMaxGLBTransmissionFactor(
+    float value)
+{
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+
+    return value;
+}
+
+
+static float MaxGLBTransmissionToFallbackOpacity(
+    float transmissionFactor)
+{
+    // Max 2016 Standard materials have no optical transmission model.
+    // Keep a little surface opacity so highlights remain visible while the
+    // watch face or other geometry below the glass can still be inspected.
+    return 1.0f -
+        0.85f *
+        ClampMaxGLBTransmissionFactor(
+            transmissionFactor);
+}
+
+
+static void StoreMaxGLBTransmissionMetadata(
+    Mtl* material,
+    BOOL hadExtension,
+    float transmissionFactor,
+    float maxOpacity)
+{
+    if (material == NULL)
+    {
+        return;
+    }
+
+    material->RemoveAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_TRANSMISSION_METADATA_SUB_ID);
+
+    MaxGLBTransmissionMetadata* metadata =
+        static_cast<MaxGLBTransmissionMetadata*>(
+            MAX_malloc(
+                sizeof(MaxGLBTransmissionMetadata)));
+
+    if (metadata == NULL)
+    {
+        return;
+    }
+
+    metadata->magic =
+        MAXGLB_TRANSMISSION_METADATA_MAGIC;
+
+    metadata->version =
+        MAXGLB_TRANSMISSION_METADATA_VERSION;
+
+    metadata->hadExtension =
+        hadExtension;
+
+    metadata->transmissionFactor =
+        ClampMaxGLBTransmissionFactor(
+            transmissionFactor);
+
+    metadata->maxOpacity =
+        maxOpacity < 0.0f
+        ? 0.0f
+        : maxOpacity > 1.0f
+            ? 1.0f
+            : maxOpacity;
+
+    material->AddAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_TRANSMISSION_METADATA_SUB_ID,
+        static_cast<DWORD>(
+            sizeof(MaxGLBTransmissionMetadata)),
+        metadata);
+}
+
+
+static BOOL ReadMaxGLBTransmissionMetadata(
+    Mtl* material,
+    MaxGLBTransmissionMetadata* output)
+{
+    if (output != NULL)
+    {
+        ZeroMemory(
+            output,
+            sizeof(MaxGLBTransmissionMetadata));
+    }
+
+    if (material == NULL ||
+        output == NULL)
+    {
+        return FALSE;
+    }
+
+    AppDataChunk* chunk =
+        material->GetAppDataChunk(
+            MAXGLB_IMPORTER_CLASS_ID,
+            MATERIAL_CLASS_ID,
+            MAXGLB_TRANSMISSION_METADATA_SUB_ID);
+
+    if (chunk == NULL ||
+        chunk->data == NULL ||
+        chunk->length <
+            sizeof(MaxGLBTransmissionMetadata))
+    {
+        return FALSE;
+    }
+
+    const MaxGLBTransmissionMetadata* metadata =
+        static_cast<const MaxGLBTransmissionMetadata*>(
+            chunk->data);
+
+    if (metadata->magic !=
+            MAXGLB_TRANSMISSION_METADATA_MAGIC ||
+        metadata->version !=
+            MAXGLB_TRANSMISSION_METADATA_VERSION)
+    {
+        return FALSE;
+    }
+
+    *output =
+        *metadata;
+
+    output->transmissionFactor =
+        ClampMaxGLBTransmissionFactor(
+            output->transmissionFactor);
+
+    output->maxOpacity =
+        output->maxOpacity < 0.0f
+        ? 0.0f
+        : output->maxOpacity > 1.0f
+            ? 1.0f
+            : output->maxOpacity;
 
     return TRUE;
 }
@@ -3887,6 +4054,19 @@ static BOOL CreateStandardMaterialForPrimitive(
                 gltfMaterial->alpha_cutoff))
         : 0.5f;
 
+    const BOOL hasTransmissionExtension =
+        gltfMaterial->has_transmission
+        ? TRUE
+        : FALSE;
+
+    const float importedTransmissionFactor =
+        hasTransmissionExtension
+        ? ClampMaxGLBTransmissionFactor(
+            static_cast<float>(
+                gltfMaterial->transmission
+                    .transmission_factor))
+        : 0.0f;
+
     if (gltfMaterial->has_pbr_metallic_roughness)
     {
         const cgltf_pbr_metallic_roughness& pbr =
@@ -3914,11 +4094,36 @@ static BOOL CreateStandardMaterialForPrimitive(
         timeValue);
 
     // OPAQUE ignores both base-color factor alpha and image alpha.
-    maxMaterial->SetOpacity(
+    // KHR_materials_transmission is optical transparency rather than alpha
+    // coverage, so use a Max Standard transparency fallback only for display.
+    float maxDisplayOpacity =
         importedAlphaMode ==
             MAXGLB_ALPHA_OPAQUE
         ? 1.0f
-        : opacity,
+        : opacity;
+
+    if (hasTransmissionExtension &&
+        importedTransmissionFactor > 0.0f)
+    {
+        maxDisplayOpacity =
+            MaxGLBTransmissionToFallbackOpacity(
+                importedTransmissionFactor);
+
+        maxMaterial->SetShininess(
+            0.9f,
+            timeValue);
+
+        maxMaterial->SetShinStr(
+            1.0f,
+            timeValue);
+
+        maxMaterial->SetIOR(
+            1.5f,
+            timeValue);
+    }
+
+    maxMaterial->SetOpacity(
+        maxDisplayOpacity,
         timeValue);
 
     BOOL hasBaseColorTexture = FALSE;
@@ -4417,6 +4622,15 @@ static BOOL CreateStandardMaterialForPrimitive(
         importedAlphaCutoff,
         existingAlphaFlags);
 
+    if (hasTransmissionExtension)
+    {
+        StoreMaxGLBTransmissionMetadata(
+            maxMaterial,
+            TRUE,
+            importedTransmissionFactor,
+            maxDisplayOpacity);
+    }
+
     AppendMaterialImportLog(_T("10: material graph complete"));
 
     maxMaterial->NotifyDependents(
@@ -4472,6 +4686,7 @@ struct MaxGLBImportStats
     int normalTextures;
     int ormTextures;
     int emissiveTextures;
+    int transmissionMaterials;
     int nextObjectIndex;
     BOOL createdParentNode;
 
@@ -4490,6 +4705,7 @@ struct MaxGLBImportStats
         , normalTextures(0)
         , ormTextures(0)
         , emissiveTextures(0)
+        , transmissionMaterials(0)
         , nextObjectIndex(0)
         , createdParentNode(FALSE)
     {
@@ -10637,6 +10853,12 @@ static BOOL ImportPrimitiveAsNode(
         ++importStats->materials;
     }
 
+    if (primitive->material != NULL &&
+        primitive->material->has_transmission)
+    {
+        ++importStats->transmissionMaterials;
+    }
+
     if (hasBaseColorTexture)
     {
         ++importStats->baseColorTextures;
@@ -11906,6 +12128,19 @@ static BOOL ImportMeshPrimitivesAsNode(
 
         ++materialCount;
 
+        const cgltf_primitive* importedPrimitive =
+            primitiveInfos[
+                primitiveInfoIndex]
+                .primitive;
+
+        if (importedPrimitive != NULL &&
+            importedPrimitive->material != NULL &&
+            importedPrimitive->material
+                ->has_transmission)
+        {
+            ++importStats->transmissionMaterials;
+        }
+
         if (hasBaseColorTexture)
         {
             ++importStats->baseColorTextures;
@@ -13029,7 +13264,7 @@ public:
             // The detailed success report is longer than 512 TCHARs.
             // VS2012's secure CRT terminates the process when _stprintf_s
             // receives a destination buffer that is too small.
-            TCHAR message[2048];
+            TCHAR message[2500];
 
             const int formatResult =
                 _stprintf_s(
@@ -13046,7 +13281,8 @@ public:
                 _T("Base-color textures: %d\n")
                 _T("Normal textures: %d\n")
                 _T("ORM texture sets: %d\n")
-                _T("Emissive textures: %d\n\n")
+                _T("Emissive textures: %d\n")
+                _T("Transmission materials: %d\n\n")
                 _T("Import behavior:\n")
                 _T("- every mesh node in the active scene is imported\n")
                 _T("- every glTF mesh node becomes one Max object\n")
@@ -13063,7 +13299,8 @@ public:
                 _T("- Root parent created: %s\n")
                 _T("- TEXCOORD_0 imported to map channel 1\n")
                 _T("- duplicate POSITION vertices welded safely\n")
-                _T("- NORMAL imported as explicit Max normals"),
+                _T("- NORMAL imported as explicit Max normals\n")
+                _T("- KHR_materials_transmission uses a Max Standard glass fallback"),
                 importStats.objectCount,
                 importStats.primitiveCount,
                 importStats.totalVertexCount,
@@ -13075,6 +13312,7 @@ public:
                 importStats.normalTextures,
                 importStats.ormTextures,
                 importStats.emissiveTextures,
+                importStats.transmissionMaterials,
                 g_activeImportSettings.importTextures
                     ? _T("yes")
                     : _T("no"),
@@ -13226,6 +13464,8 @@ struct MaxGLBExportMaterial
     float alphaCutoff;
     DWORD alphaMetadataFlags;
     BOOL preservedOriginalOrm;
+    BOOL hasTransmission;
+    float transmissionFactor;
 
     float baseColor[4];
 
@@ -13244,6 +13484,8 @@ struct MaxGLBExportMaterial
         , alphaCutoff(0.5f)
         , alphaMetadataFlags(0)
         , preservedOriginalOrm(FALSE)
+        , hasTransmission(FALSE)
+        , transmissionFactor(0.0f)
     {
         baseColor[0] = 1.0f;
         baseColor[1] = 1.0f;
@@ -15338,6 +15580,42 @@ static BOOL CaptureMaterialMaps(
 
     outputMaterial->alphaMetadataFlags =
         storedAlphaFlags;
+
+    MaxGLBTransmissionMetadata transmissionMetadata;
+
+    if (ReadMaxGLBTransmissionMetadata(
+            nodeMaterial,
+            &transmissionMetadata))
+    {
+        outputMaterial->hasTransmission =
+            transmissionMetadata.hadExtension
+            ? TRUE
+            : FALSE;
+
+        const float currentOpacity =
+            ClampUnitFloat(
+                standardMaterial->GetOpacity(
+                    timeValue));
+
+        if (MaxGLBNearlyEqual(
+                currentOpacity,
+                transmissionMetadata.maxOpacity,
+                1.0e-4f))
+        {
+            outputMaterial->transmissionFactor =
+                transmissionMetadata
+                    .transmissionFactor;
+        }
+        else
+        {
+            // The artist changed the Max fallback opacity. Convert the edit
+            // back through the same 85-percent display range used on import.
+            outputMaterial->transmissionFactor =
+                ClampMaxGLBTransmissionFactor(
+                    (1.0f - currentOpacity) /
+                    0.85f);
+        }
+    }
 
     if (exportSettings.alphaMode !=
         MAXGLB_ALPHA_AUTO)
@@ -18063,6 +18341,9 @@ static BOOL WriteGeometryGlbFile(
     BOOL usesTextureTransformExtension =
         FALSE;
 
+    BOOL usesTransmissionExtension =
+        FALSE;
+
     for (size_t meshIndex = 0;
          meshIndex < meshes.size();
          ++meshIndex)
@@ -18203,6 +18484,12 @@ static BOOL WriteGeometryGlbFile(
         {
             layout.materialIndex =
                 nextMaterialIndex++;
+
+            if (mesh.material.hasTransmission)
+            {
+                usesTransmissionExtension =
+                    TRUE;
+            }
 
             for (int roleIndex = 0;
                  roleIndex < MAXGLB_TEXTURE_COUNT;
@@ -18345,12 +18632,36 @@ static BOOL WriteGeometryGlbFile(
         << "\"generator\":\"MaxGLB2016\""
         << "}";
 
-    if (usesTextureTransformExtension)
+    if (usesTextureTransformExtension ||
+        usesTransmissionExtension)
     {
         json
-            << ",\"extensionsUsed\":["
-            << "\"KHR_texture_transform\""
-            << "]";
+            << ",\"extensionsUsed\":[";
+
+        BOOL firstExtension =
+            TRUE;
+
+        if (usesTextureTransformExtension)
+        {
+            json
+                << "\"KHR_texture_transform\"";
+
+            firstExtension =
+                FALSE;
+        }
+
+        if (usesTransmissionExtension)
+        {
+            if (!firstExtension)
+            {
+                json << ",";
+            }
+
+            json
+                << "\"KHR_materials_transmission\"";
+        }
+
+        json << "]";
     }
 
     json
@@ -18894,6 +19205,16 @@ static BOOL WriteGeometryGlbFile(
 
                 json
                     << ",\"emissiveFactor\":[1,1,1]";
+            }
+
+            if (mesh.material.hasTransmission)
+            {
+                json
+                    << ",\"extensions\":{"
+                    << "\"KHR_materials_transmission\":{"
+                    << "\"transmissionFactor\":"
+                    << mesh.material.transmissionFactor
+                    << "}}";
             }
 
             if (mesh.material.doubleSided)
@@ -19514,6 +19835,7 @@ public:
         size_t exportedEmissiveTextures = 0;
         size_t alphaBlendMaterials = 0;
         size_t alphaMaskMaterials = 0;
+        size_t transmissionMaterials = 0;
 
         for (size_t meshIndex = 0;
              meshIndex < meshes.size();
@@ -19612,6 +19934,11 @@ public:
                 ++exportedEmissiveTextures;
             }
 
+            if (meshes[meshIndex].material.hasTransmission)
+            {
+                ++transmissionMaterials;
+            }
+
             if (meshes[meshIndex].material.alphaMode ==
                 MAXGLB_ALPHA_BLEND)
             {
@@ -19664,7 +19991,8 @@ public:
                 _T("Exact imported ORM round-trips: %u\n")
                 _T("Emissive textures: %u\n")
                 _T("Alpha BLEND materials: %u\n")
-                _T("Alpha MASK materials: %u\n\n")
+                _T("Alpha MASK materials: %u\n")
+                _T("Transmission materials: %u\n\n")
                 _T("Export settings:\n")
                 _T("- size mode: %s\n")
                 _T("- applied uniform scale: %.7g\n")
@@ -19684,6 +20012,7 @@ public:
                 _T("- hard edges and UV seams preserved\n")
                 _T("- KHR_texture_transform offset/scale/rotation\n")
                 _T("- REPEAT / CLAMP_TO_EDGE / MIRRORED_REPEAT samplers\n")
+                _T("- KHR_materials_transmission factor round-trip\n")
                 _T("- Face Material IDs exported as glTF primitives\n")
                 _T("- Multi/Sub-Object sub-materials preserved\n\n")
                 _T("Output:\n%s%s"),
@@ -19726,6 +20055,8 @@ public:
                     alphaBlendMaterials),
                 static_cast<unsigned int>(
                     alphaMaskMaterials),
+                static_cast<unsigned int>(
+                    transmissionMaterials),
                 exportSettings.normalizeSize
                     ? _T("normalize largest dimension")
                     : _T("uniform scale factor"),

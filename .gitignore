@@ -1,0 +1,41 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build output
+bin/
+obj/
+x64/
+Debug/
+Release/
+*.dle
+*.dll
+*.exe
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.mui
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.userprefs
+
+# Local development backups
+_local_backups/
+reference/
+
+# Local test assets
+test_assets/
+*.glb
+*.gltf
+*.bin
+
+# Windows
+Thumbs.db
+Desktop.ini

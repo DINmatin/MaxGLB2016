@@ -402,6 +402,16 @@ static const DWORD MAXGLB_TRANSMISSION_METADATA_SUB_ID =
     0x54524E53u; // "TRNS"
 
 
+static const DWORD MAXGLB_PBR_METADATA_MAGIC =
+    0x50425246u; // "PBRF"
+
+static const DWORD MAXGLB_PBR_METADATA_VERSION =
+    1u;
+
+static const DWORD MAXGLB_PBR_METADATA_SUB_ID =
+    0x50425246u; // "PBRF"
+
+
 // Version 1 was used by the first Stage-13 importer build. Keep the
 // layout here so scenes imported with that build can still be exported.
 struct MaxGLBTextureMetadataV1
@@ -1700,6 +1710,154 @@ static BOOL ReadMaxGLBAlphaMetadata(
         *outFlags =
             metadata->flags;
     }
+
+    return TRUE;
+}
+
+
+struct MaxGLBPbrMetadata
+{
+    DWORD magic;
+    DWORD version;
+
+    float metallicFactor;
+    float roughnessFactor;
+
+    // Snapshot of the Max Standard glossiness value used for the imported
+    // roughness factor. If the artist edits glossiness, the exporter converts
+    // the edit back to an approximate glTF roughness factor.
+    float maxShininess;
+};
+
+
+static float ClampMaxGLBMaterialFactor(
+    float value)
+{
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+
+    return value;
+}
+
+
+static void StoreMaxGLBPbrMetadata(
+    Mtl* material,
+    float metallicFactor,
+    float roughnessFactor,
+    float maxShininess)
+{
+    if (material == NULL)
+    {
+        return;
+    }
+
+    material->RemoveAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_PBR_METADATA_SUB_ID);
+
+    MaxGLBPbrMetadata* metadata =
+        static_cast<MaxGLBPbrMetadata*>(
+            MAX_malloc(
+                sizeof(MaxGLBPbrMetadata)));
+
+    if (metadata == NULL)
+    {
+        return;
+    }
+
+    metadata->magic =
+        MAXGLB_PBR_METADATA_MAGIC;
+
+    metadata->version =
+        MAXGLB_PBR_METADATA_VERSION;
+
+    metadata->metallicFactor =
+        ClampMaxGLBMaterialFactor(
+            metallicFactor);
+
+    metadata->roughnessFactor =
+        ClampMaxGLBMaterialFactor(
+            roughnessFactor);
+
+    metadata->maxShininess =
+        ClampMaxGLBMaterialFactor(
+            maxShininess);
+
+    material->AddAppDataChunk(
+        MAXGLB_IMPORTER_CLASS_ID,
+        MATERIAL_CLASS_ID,
+        MAXGLB_PBR_METADATA_SUB_ID,
+        static_cast<DWORD>(
+            sizeof(MaxGLBPbrMetadata)),
+        metadata);
+}
+
+
+static BOOL ReadMaxGLBPbrMetadata(
+    Mtl* material,
+    MaxGLBPbrMetadata* output)
+{
+    if (output != NULL)
+    {
+        ZeroMemory(
+            output,
+            sizeof(MaxGLBPbrMetadata));
+    }
+
+    if (material == NULL ||
+        output == NULL)
+    {
+        return FALSE;
+    }
+
+    AppDataChunk* chunk =
+        material->GetAppDataChunk(
+            MAXGLB_IMPORTER_CLASS_ID,
+            MATERIAL_CLASS_ID,
+            MAXGLB_PBR_METADATA_SUB_ID);
+
+    if (chunk == NULL ||
+        chunk->data == NULL ||
+        chunk->length <
+            sizeof(MaxGLBPbrMetadata))
+    {
+        return FALSE;
+    }
+
+    const MaxGLBPbrMetadata* metadata =
+        static_cast<const MaxGLBPbrMetadata*>(
+            chunk->data);
+
+    if (metadata->magic !=
+            MAXGLB_PBR_METADATA_MAGIC ||
+        metadata->version !=
+            MAXGLB_PBR_METADATA_VERSION)
+    {
+        return FALSE;
+    }
+
+    *output =
+        *metadata;
+
+    output->metallicFactor =
+        ClampMaxGLBMaterialFactor(
+            output->metallicFactor);
+
+    output->roughnessFactor =
+        ClampMaxGLBMaterialFactor(
+            output->roughnessFactor);
+
+    output->maxShininess =
+        ClampMaxGLBMaterialFactor(
+            output->maxShininess);
 
     return TRUE;
 }
@@ -4041,6 +4199,8 @@ static BOOL CreateStandardMaterialForPrimitive(
 
     Color baseColor(1.0f, 1.0f, 1.0f);
     float opacity = 1.0f;
+    float importedMetallicFactor = 1.0f;
+    float importedRoughnessFactor = 1.0f;
 
     const int importedAlphaMode =
         ConvertCgltfAlphaMode(
@@ -4079,7 +4239,25 @@ static BOOL CreateStandardMaterialForPrimitive(
 
         opacity =
             static_cast<float>(pbr.base_color_factor[3]);
+
+        importedMetallicFactor =
+            ClampMaxGLBMaterialFactor(
+                static_cast<float>(
+                    pbr.metallic_factor));
+
+        importedRoughnessFactor =
+            ClampMaxGLBMaterialFactor(
+                static_cast<float>(
+                    pbr.roughness_factor));
     }
+
+    const float importedMaxShininess =
+        1.0f -
+        importedRoughnessFactor;
+
+    maxMaterial->SetShininess(
+        importedMaxShininess,
+        timeValue);
 
     maxMaterial->SetDiffuse(
         baseColor,
@@ -4108,10 +4286,6 @@ static BOOL CreateStandardMaterialForPrimitive(
         maxDisplayOpacity =
             MaxGLBTransmissionToFallbackOpacity(
                 importedTransmissionFactor);
-
-        maxMaterial->SetShininess(
-            0.9f,
-            timeValue);
 
         maxMaterial->SetShinStr(
             1.0f,
@@ -4601,6 +4775,12 @@ static BOOL CreateStandardMaterialForPrimitive(
     }
 
     }
+
+    StoreMaxGLBPbrMetadata(
+        maxMaterial,
+        importedMetallicFactor,
+        importedRoughnessFactor,
+        importedMaxShininess);
 
     int existingAlphaMode =
         MAXGLB_ALPHA_OPAQUE;
@@ -13467,6 +13647,8 @@ struct MaxGLBExportMaterial
     BOOL hasTransmission;
     float transmissionFactor;
 
+    float metallicFactor;
+    float roughnessFactor;
     float baseColor[4];
 
     std::string name;
@@ -13486,6 +13668,8 @@ struct MaxGLBExportMaterial
         , preservedOriginalOrm(FALSE)
         , hasTransmission(FALSE)
         , transmissionFactor(0.0f)
+        , metallicFactor(0.0f)
+        , roughnessFactor(1.0f)
     {
         baseColor[0] = 1.0f;
         baseColor[1] = 1.0f;
@@ -15563,6 +15747,50 @@ static BOOL CaptureMaterialMaps(
     outputMaterial->doubleSided =
         standardMaterial->GetTwoSided();
 
+    const float currentShininess =
+        ClampMaxGLBMaterialFactor(
+            standardMaterial->GetShininess(
+                timeValue));
+
+    MaxGLBPbrMetadata pbrMetadata;
+
+    const BOOL hasStoredPbr =
+        ReadMaxGLBPbrMetadata(
+            nodeMaterial,
+            &pbrMetadata);
+
+    if (hasStoredPbr)
+    {
+        outputMaterial->metallicFactor =
+            pbrMetadata.metallicFactor;
+
+        if (MaxGLBNearlyEqual(
+                currentShininess,
+                pbrMetadata.maxShininess,
+                1.0e-4f))
+        {
+            outputMaterial->roughnessFactor =
+                pbrMetadata.roughnessFactor;
+        }
+        else
+        {
+            outputMaterial->roughnessFactor =
+                1.0f -
+                currentShininess;
+        }
+    }
+    else
+    {
+        // A Max-authored Standard material has no metallic workflow.
+        // Default to dielectric and convert Glossiness to roughness.
+        outputMaterial->metallicFactor =
+            0.0f;
+
+        outputMaterial->roughnessFactor =
+            1.0f -
+            currentShininess;
+    }
+
     int storedAlphaMode =
         MAXGLB_ALPHA_OPAQUE;
 
@@ -15702,6 +15930,13 @@ static BOOL CaptureMaterialMaps(
             nodeMaterial,
             standardMaterial,
             ID_SI);
+
+    if (!hasStoredPbr &&
+        metallicBitmap != NULL)
+    {
+        outputMaterial->metallicFactor =
+            1.0f;
+    }
 
     MaxGLBExportImageData diffuseImage;
 
@@ -19125,12 +19360,10 @@ static BOOL WriteGeometryGlbFile(
                 << mesh.material.baseColor[3]
                 << "],"
                 << "\"metallicFactor\":"
-                << (layout.hasTextureView[
-                        MAXGLB_USAGE_METALLIC_ROUGHNESS]
-                    ? 1
-                    : 0)
+                << mesh.material.metallicFactor
                 << ","
-                << "\"roughnessFactor\":1";
+                << "\"roughnessFactor\":"
+                << mesh.material.roughnessFactor;
 
             if (layout.hasTextureView[
                     MAXGLB_USAGE_BASE_COLOR])

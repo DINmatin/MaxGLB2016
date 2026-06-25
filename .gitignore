@@ -1,11 +1,17 @@
-# Visual Studio
+# Visual Studio user files and databases
 .vs/
 *.suo
 *.user
 *.userosscache
 *.sln.docstates
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.opendb
+*.ipch
 
-# Build output
+# Build output and intermediate files
 bin/
 obj/
 x64/
@@ -19,6 +25,12 @@ Release/
 *.ilk
 *.pdb
 *.mui
+*.obj
+*.res
+*.idb
+*.pch
+*.tlog
+*.lastbuildstate
 
 # Logs and temporary files
 *.log
@@ -26,18 +38,25 @@ Release/
 *.bak
 *.userprefs
 
-# Local development backups
+# Local development backups and Autodesk reference source
 _local_backups/
 reference/
 
-# Local test assets
+# Local test assets and extracted textures
 test_assets/
+*_MaxGLB_Textures/
 *.glb
 *.gltf
 *.bin
 
+# Temporary repository inspection reports
+repo-status.txt
+tracked-files.txt
+project-tree.txt
+remotes.txt
+git-size.txt
+largest-files.txt
+
 # Windows
 Thumbs.db
-Desktop.ini*.sdf
-*.opensdf
-*.sdf
+Desktop.ini
